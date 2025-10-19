@@ -1,0 +1,16 @@
+# Dépendances pour le pipeline de veille réglementaire
+
+# Cloud Functions Framework
+functions-framework==3.*
+
+# Google Cloud
+google-cloud-firestore==2.*
+
+# Extraction de contenu web
+trafilatura==1.*
+requests==2.*
+
+# Parsing HTML (utilisé par trafilatura)
+beautifulsoup4==4.*
+lxml==4.*
+

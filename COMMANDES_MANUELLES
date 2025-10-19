@@ -1,0 +1,10 @@
+REM Configurer le projet
+gcloud config set project agent-gcp-f6005
+
+REM Déployer le pipeline
+cd deploiement-veille\pipeline-veille
+gcloud functions deploy surveiller-sites --gen2 --runtime=python311 --region=us-west1 --source=. --entry-point=surveiller_sites --trigger-http --allow-unauthenticated --memory=1GB --timeout=540s --set-env-vars=PROJECT_ID=agent-gcp-f6005
+
+REM Déployer l'agent
+cd ..\agent-fiscal
+gcloud functions deploy agent-fiscal-v2 --gen2 --runtime=python311 --region=us-west1 --source=. --entry-point=agent_fiscal --trigger-http --allow-unauthenticated --memory=512MB --timeout=60s --set-env-vars=PROJECT_ID=agent-gcp-f6005

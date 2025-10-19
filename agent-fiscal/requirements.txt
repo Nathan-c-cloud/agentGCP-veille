@@ -1,0 +1,12 @@
+# Dépendances pour l'agent fiscal conversationnel
+
+# Cloud Functions Framework
+functions-framework==3.*
+
+# Google Cloud
+google-cloud-firestore==2.*
+google-cloud-aiplatform==1.*
+
+# Flask (utilisé par functions-framework)
+flask==3.*
+
