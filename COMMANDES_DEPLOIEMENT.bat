@@ -4,7 +4,7 @@ REM Script de déploiement pour Windows
 REM À exécuter dans Google Cloud Shell ou sur Windows avec gcloud CLI installé
 
 echo ==========================================
-echo DEPLOIEMENT AGENT FISCAL - SYSTEME COMPLET
+echo DEPLOIEMENT SYSTEME COMPLET - AGENT MULTI-SPECIALISE
 echo ==========================================
 echo.
 
@@ -41,7 +41,7 @@ echo.
 echo Pipeline deploye avec succes !
 echo.
 
-REM Déployer l'agent
+REM Déployer l'agent fiscal
 echo ==========================================
 echo 2. DEPLOIEMENT DE L'AGENT FISCAL
 echo ==========================================
@@ -63,7 +63,32 @@ echo Deploiement de agent-fiscal-v2...
 call gcloud functions deploy agent-fiscal-v2 --gen2 --runtime=python311 --region=%REGION% --source=. --entry-point=agent_fiscal --trigger-http --allow-unauthenticated --memory=512MB --timeout=60s --set-env-vars=PROJECT_ID=%PROJECT_ID%
 
 echo.
-echo Agent deploye avec succes !
+echo Agent fiscal deploye avec succes !
+echo.
+
+REM Déployer l'agent client orchestrateur
+echo ==========================================
+echo 3. DEPLOIEMENT DE L'AGENT CLIENT (ORCHESTRATEUR)
+echo ==========================================
+
+cd ..
+
+if not exist "Agent-client" (
+    echo ERREUR: Le repertoire Agent-client n'existe pas !
+    pause
+    exit /b 1
+)
+
+echo Changement vers Agent-client...
+cd Agent-client
+echo Repertoire actuel: %CD%
+echo.
+
+echo Deploiement de agent-client (orchestrateur intelligent)...
+call gcloud functions deploy agent-client --gen2 --runtime=python311 --region=%REGION% --source=. --entry-point=agent_client --trigger-http --allow-unauthenticated --memory=512MB --timeout=60s --set-env-vars=PROJECT_ID=%PROJECT_ID%
+
+echo.
+echo Agent client deploye avec succes !
 echo.
 
 cd ..
@@ -73,17 +98,12 @@ echo DEPLOIEMENT TERMINE
 echo ==========================================
 echo.
 echo Fonctions deployees:
-echo   1. surveiller-sites (Pipeline ETL )
-echo   2. agent-fiscal-v2 (Agent conversationnel)
+echo   1. surveiller-sites (Pipeline ETL)
+echo   2. agent-fiscal-v2 (Agent fiscal specialise)
+echo   3. agent-client (Orchestrateur intelligent - POINT D'ENTREE)
 echo.
-echo Pour obtenir les URLs:
-echo   gcloud functions describe surveiller-sites --region=%REGION% --gen2
-echo   gcloud functions describe agent-fiscal-v2 --region=%REGION% --gen2
+echo ARCHITECTURE:
+echo   Frontend --^> agent-client --^> agent-fiscal-v2
+echo                              --^> [autres agents futurs]
 echo.
-echo PROCHAINES ETAPES:
-echo   1. Ajouter les sources: python ajouter_sources_firestore.py
-echo   2. Executer le pipeline pour creer les chunks
-echo   3. Connecter votre frontend
-echo.
-pause
 ENDLOCAL

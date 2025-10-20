@@ -53,6 +53,7 @@ gcloud functions deploy agent-fiscal-v2 \
 ## 📖 Documentation Complète
 
 Consultez `GUIDE_DEPLOIEMENT_SEPARE.md` pour :
+
 - Instructions détaillées
 - Vérification et tests
 - Dépannage
