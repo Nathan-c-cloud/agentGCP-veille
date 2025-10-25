@@ -1,1 +1,36 @@
-.idea
+# Fichiers Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Environnements virtuels
+venv/
+env/
+ENV/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Fichiers sensibles - NE JAMAIS COMMIT !
+.env
+.env.local
+.env.*.local
+
+# Clés API et secrets
+*.key
+*.pem
+secrets/
+credentials.json
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
