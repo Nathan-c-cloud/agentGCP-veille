@@ -1,16 +1,15 @@
-# Dépendances pour le pipeline de veille réglementaire
+# Dépendances pour le pipeline de veille
 
 # Cloud Functions Framework
 functions-framework==3.*
 
 # Google Cloud
 google-cloud-firestore==2.*
+google-cloud-storage==2.*
 
-# Extraction de contenu web
-trafilatura==1.*
+# Requêtes HTTP pour Custom Search API
 requests==2.*
 
-# Parsing HTML (utilisé par trafilatura)
+# Parser HTML pour extraire le contenu complet des pages
 beautifulsoup4==4.*
-lxml==4.*
 

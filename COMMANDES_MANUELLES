@@ -1,10 +1,54 @@
-REM Configurer le projet
+REM ====================================================================
+REM COMMANDES MANUELLES - SYSTEME DE VEILLE AVEC CLOUD STORAGE
+REM ====================================================================
+
+REM 1. Configurer le projet
 gcloud config set project agent-gcp-f6005
 
-REM Déployer le pipeline
-cd deploiement-veille\pipeline-veille
-gcloud functions deploy surveiller-sites --gen2 --runtime=python311 --region=us-west1 --source=. --entry-point=surveiller_sites --trigger-http --allow-unauthenticated --memory=1GB --timeout=540s --set-env-vars=PROJECT_ID=agent-gcp-f6005
+REM 2. Créer le bucket Cloud Storage
+gsutil mb -p agent-gcp-f6005 -c STANDARD -l us-west1 gs://agent-veille-documents
 
-REM Déployer l'agent
+REM 3. Migrer les données de Firestore vers Cloud Storage (si nécessaire)
+python migrer_firestore_vers_storage.py
+
+REM 4. Déployer le pipeline (avec Cloud Storage)
+cd pipeline-veille
+gcloud functions deploy surveiller-sites --gen2 --runtime=python311 --region=us-west1 --source=. --entry-point=surveiller_sites --trigger-http --allow-unauthenticated --memory=1GB --timeout=540s --set-env-vars=PROJECT_ID=agent-gcp-f6005,BUCKET_NAME=agent-veille-documents
+
+REM 5. Déployer l'agent fiscal (avec Cloud Storage + Google Search)
 cd ..\agent-fiscal
-gcloud functions deploy agent-fiscal-v2 --gen2 --runtime=python311 --region=us-west1 --source=. --entry-point=agent_fiscal --trigger-http --allow-unauthenticated --memory=512MB --timeout=60s --set-env-vars=PROJECT_ID=agent-gcp-f6005
+gcloud functions deploy agent-fiscal-v2 --gen2 --runtime=python311 --region=us-west1 --source=. --entry-point=agent_fiscal --trigger-http --allow-unauthenticated --memory=512MB --timeout=60s --set-env-vars=PROJECT_ID=agent-gcp-f6005,BUCKET_NAME=agent-veille-documents,GOOGLE_API_KEY=VOTRE_CLE_API,SEARCH_ENGINE_ID=VOTRE_SEARCH_ENGINE_ID
+
+REM 6. Déployer l'agent client (orchestrateur)
+cd ..\Agent-client
+gcloud functions deploy agent-client --gen2 --runtime=python311 --region=us-west1 --source=. --entry-point=agent_client --trigger-http --allow-unauthenticated --memory=512MB --timeout=60s --set-env-vars=PROJECT_ID=agent-gcp-f6005
+
+REM ====================================================================
+REM COMMANDES DE TEST
+REM ====================================================================
+
+REM Tester l'agent fiscal
+curl -X POST https://us-west1-agent-gcp-f6005.cloudfunctions.net/agent-fiscal-v2 -H "Content-Type: application/json" -d "{\"question\": \"C'est quoi la TVA ?\"}"
+
+REM Tester l'agent client (orchestrateur)
+curl -X POST https://us-west1-agent-gcp-f6005.cloudfunctions.net/agent-client -H "Content-Type: application/json" -d "{\"question\": \"Quelle est la TVA applicable ?\"}"
+
+REM Vérifier les logs
+gcloud functions logs read agent-fiscal-v2 --region=us-west1 --limit=50
+
+REM ====================================================================
+REM GESTION DU BUCKET
+REM ====================================================================
+
+REM Lister les documents dans le bucket
+gsutil ls gs://agent-veille-documents/documents_fiscaux/
+
+REM Télécharger un document spécifique
+gsutil cp gs://agent-veille-documents/documents_fiscaux/DOC_ID.json .
+
+REM Supprimer tous les documents
+gsutil -m rm gs://agent-veille-documents/documents_fiscaux/**
+
+REM ====================================================================
+REM NOTE : Consultez GUIDE_GOOGLE_SEARCH_API.md pour configurer Google Search
+REM ====================================================================

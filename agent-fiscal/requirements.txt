@@ -4,9 +4,15 @@
 functions-framework==3.*
 
 # Google Cloud
-google-cloud-firestore==2.*
+google-cloud-storage==2.*
 google-cloud-aiplatform==1.*
+google-cloud-firestore==2.*
 
 # Flask (utilisé par functions-framework)
 flask==3.*
 
+# Requests pour Google Custom Search API
+requests==2.*
+
+# Numpy pour calculs d'embeddings et similarité cosinus
+numpy==1.24.*

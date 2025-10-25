@@ -1,158 +1,183 @@
-from google.cloud import firestore
-from typing import List, Dict
+import json
 import os
+from typing import List, Dict, Optional
+
+from google.cloud import firestore, storage
 
 
-class FirestoreLoader:
-    """Charge les documents complets dans Firestore de manière optimisée."""
+class GoogleCloudStorageLoader:
+    """Charge et supprime les documents (format JSON) dans Google Cloud Storage."""
 
-    def __init__(self, project_id: str = None):
+    def __init__(self, bucket_name: str):
+        self.storage_client = storage.Client()
+        self.bucket = self.storage_client.bucket(bucket_name)
+
+    def charger_document(self, document_data: Dict) -> str:
         """
+        Charge un document complet (métadonnées + contenu) en JSON sur GCS.
+
         Args:
-            project_id: ID du projet GCP (optionnel, utilise la variable d'environnement par défaut)
+            document_data: Dictionnaire contenant toutes les données du document.
+
+        Returns:
+            Le chemin GCS du fichier chargé.
         """
+        document_id = document_data.get("document_id")
+        if not document_id:
+            raise ValueError("document_data doit contenir un 'document_id'")
+
+        blob_name = f"documents/{document_id}.json"
+        blob = self.bucket.blob(blob_name)
+
+        # Convertir en JSON et uploader
+        json_content = json.dumps(document_data, ensure_ascii=False, indent=2)
+        blob.upload_from_string(json_content, content_type="application/json")
+
+        print(f"  ✅ Document '{document_id}' chargé sur GCS: gs://{self.bucket.name}/{blob_name}")
+        return f"gs://{self.bucket.name}/{blob_name}"
+
+    def supprimer_document(self, document_id: str):
+        """
+        Supprime un document JSON de GCS.
+
+        Args:
+            document_id: L'ID du document à supprimer.
+        """
+        blob_name = f"documents/{document_id}.json"
+        blob = self.bucket.blob(blob_name)
+        if blob.exists():
+            blob.delete()
+            print(f"  🗑️ Document '{document_id}' supprimé de GCS.")
+        else:
+            print(f"  ⚠️ Document '{document_id}' non trouvé sur GCS pour suppression.")
+
+    def lire_document(self, document_id: str) -> Optional[Dict]:
+        """
+        Lit un document JSON complet depuis GCS.
+
+        Args:
+            document_id: L'ID du document à lire.
+
+        Returns:
+            Le dictionnaire du document ou None si non trouvé.
+        """
+        blob_name = f"documents/{document_id}.json"
+        blob = self.bucket.blob(blob_name)
+        if blob.exists():
+            json_content = blob.download_as_text()
+            return json.loads(json_content)
+        return None
+
+
+class PipelineLoader:
+    """Charge les documents complets (métadonnées + contenu) dans Cloud Storage au format JSON."""
+
+    def __init__(self, project_id: str = None, gcs_bucket_name: str = "documents-fiscaux-bucket"):
         if project_id:
             self.db = firestore.Client(project=project_id)
         else:
             self.db = firestore.Client()
+        self.gcs_loader = GoogleCloudStorageLoader(bucket_name=gcs_bucket_name)
+        self.gcs_bucket_name = gcs_bucket_name
 
-        # Nom de la collection où seront stockés les documents complets
-        self.collection_name = "documents_fiscaux_complets"
-
-    def charger_documents(self, documents: List[Dict], batch_size: int = 500) -> int:
+    def charger_documents(self, documents: List[Dict]) -> int:
         """
-        Charge une liste de documents complets dans Firestore.
+        Charge les documents complets (métadonnées + contenu) en JSON dans GCS uniquement.
+        Plus besoin de Firestore pour les métadonnées, tout est dans le JSON.
 
         Args:
-            documents: Liste de dictionnaires représentant les documents complets
-            batch_size: Nombre de documents par batch (max 500 pour Firestore)
+            documents: Liste de dictionnaires représentant les documents complets.
 
         Returns:
-            Nombre de documents chargés avec succès
+            Nombre de documents chargés avec succès.
         """
         if not documents:
-            print("  Aucun document à charger")
+            print("  ⚠️ Aucun document à charger")
             return 0
 
         total = len(documents)
-        print(f"\n Chargement de {total} documents dans Firestore...")
-        print(f"   Collection: {self.collection_name}")
+        print(f"\n💾 Chargement de {total} documents en JSON...")
 
-        collection_ref = self.db.collection(self.collection_name)
         documents_charges = 0
+        for i, doc_data in enumerate(documents):
+            document_id = doc_data.get("document_id")
 
-        # Traiter par batches pour respecter les limites de Firestore
-        for i in range(0, total, batch_size):
-            batch = self.db.batch()
-            batch_docs = documents[i:i + batch_size]
+            if not document_id:
+                print(f"  ⚠️ Document sans ID ignoré: {doc_data.get('source_url', 'URL inconnue')}")
+                continue
 
-            for doc_data in batch_docs:
-                # Utiliser document_id comme ID du document Firestore
-                document_id = doc_data.get("document_id")
-                if not document_id:
-                    print(f"  Document sans ID ignoré")
-                    continue
-
-                doc_ref = collection_ref.document(document_id)
-
-                # Ajouter un timestamp de dernière mise à jour
-                doc_avec_timestamp = {
-                    **doc_data,
-                    "derniere_verification": firestore.SERVER_TIMESTAMP
-                }
-
-                # merge=True permet de mettre à jour sans écraser les champs non mentionnés
-                batch.set(doc_ref, doc_avec_timestamp, merge=True)
+            try:
+                # Charger le document complet en JSON sur GCS
+                gcs_path = self.gcs_loader.charger_document(doc_data)
                 documents_charges += 1
 
-            # Commit du batch
-            try:
-                batch.commit()
-                print(
-                    f" Batch {i // batch_size + 1}/{(total + batch_size - 1) // batch_size} chargé ({len(batch_docs)} documents)")
             except Exception as e:
-                print(f"  Erreur lors du commit du batch {i // batch_size + 1}: {e}")
-                documents_charges -= len(batch_docs)
+                print(f"  ❌ Erreur lors du chargement du document '{document_id}': {e}")
+                continue
 
-        print(f"\n Chargement terminé : {documents_charges}/{total} documents chargés avec succès")
+        print(f"\n✅ Chargement terminé : {documents_charges}/{total} documents traités avec succès")
         return documents_charges
 
     def supprimer_anciens_documents(self, source_url: str) -> int:
         """
-        Supprime tous les documents d'une source URL spécifique.
-        Utile pour rafraîchir le contenu d'une page qui a été mise à jour.
-
-        Args:
-            source_url: L'URL source dont il faut supprimer les documents
-
-        Returns:
-            Nombre de documents supprimés
+        Supprime tous les documents JSON d'une source URL spécifique de GCS.
+        Parcourt tous les fichiers JSON et supprime ceux qui correspondent à l'URL.
         """
-        print(f"\n  Suppression des anciens documents de {source_url}...")
+        print(f"\n🗑️ Suppression des anciens documents de {source_url}...")
 
-        collection_ref = self.db.collection(self.collection_name)
+        bucket = self.gcs_loader.bucket
+        blobs = bucket.list_blobs(prefix="documents/")
 
-        # Requête pour trouver tous les documents de cette source
-        query = collection_ref.where("source_url", "==", source_url)
-        docs = query.stream()
-
-        # Supprimer par batch
-        batch = self.db.batch()
         count = 0
+        for blob in blobs:
+            if not blob.name.endswith('.json'):
+                continue
 
-        for doc in docs:
-            batch.delete(doc.reference)
-            count += 1
+            try:
+                # Lire le JSON pour vérifier l'URL source
+                json_content = blob.download_as_text()
+                doc_data = json.loads(json_content)
 
-            # Commit tous les 500 documents (limite Firestore)
-            if count % 500 == 0:
-                batch.commit()
-                batch = self.db.batch()
+                if doc_data.get('source_url') == source_url:
+                    blob.delete()
+                    count += 1
+                    print(f"  🗑️ Supprimé: {blob.name}")
 
-        # Commit final
-        if count % 500 != 0:
-            batch.commit()
+            except Exception as e:
+                print(f"  ⚠️ Erreur lors de la vérification de {blob.name}: {e}")
+                continue
 
-        print(f" {count} anciens documents supprimés")
-        return count
-
-    def compter_documents(self) -> int:
-        """
-        Compte le nombre total de documents dans la collection.
-
-        Returns:
-            Nombre total de documents
-        """
-        collection_ref = self.db.collection(self.collection_name)
-
-        # Firestore n'a pas de count() direct, on doit itérer
-        # Pour une vraie production, utiliser un compteur séparé ou Cloud Functions
-        docs = collection_ref.stream()
-        count = sum(1 for _ in docs)
-
+        print(f"  ✅ {count} anciens documents supprimés de GCS.")
         return count
 
     def obtenir_statistiques(self) -> Dict:
         """
-        Obtient des statistiques sur la collection de documents.
-
-        Returns:
-            Dictionnaire avec des statistiques
+        Obtient des statistiques en lisant tous les fichiers JSON dans GCS.
         """
-        print("\n Calcul des statistiques...")
+        print("\n📊 Calcul des statistiques depuis Cloud Storage...")
 
-        collection_ref = self.db.collection(self.collection_name)
-        docs = collection_ref.stream()
+        bucket = self.gcs_loader.bucket
+        blobs = bucket.list_blobs(prefix="documents/")
 
         total_documents = 0
         sources_uniques = set()
         taille_totale = 0
 
-        for doc in docs:
-            total_documents += 1
-            data = doc.to_dict()
-            sources_uniques.add(data.get("source_url", ""))
-            taille_totale += data.get("taille_caracteres", 0)
+        for blob in blobs:
+            if not blob.name.endswith('.json'):
+                continue
+
+            try:
+                json_content = blob.download_as_text()
+                doc_data = json.loads(json_content)
+
+                total_documents += 1
+                sources_uniques.add(doc_data.get("source_url", ""))
+                taille_totale += len(doc_data.get("contenu", ""))
+
+            except Exception as e:
+                print(f"  ⚠️ Erreur lecture de {blob.name}: {e}")
+                continue
 
         stats = {
             "total_documents": total_documents,
@@ -169,49 +194,54 @@ class FirestoreLoader:
 
 
 # Fonction utilitaire pour usage direct
-def charger_dans_firestore(documents: List[Dict], project_id: str = None) -> int:
+def charger_documents_pipeline(documents: List[Dict], project_id: str = None,
+                               gcs_bucket_name: str = "documents-fiscaux-bucket") -> int:
     """
-    Fonction utilitaire pour charger des documents rapidement.
-
-    Args:
-        documents: Liste de documents à charger
-        project_id: ID du projet GCP (optionnel)
-
-    Returns:
-        Nombre de documents chargés
+    Fonction utilitaire pour charger des documents rapidement via le pipeline.
+    Les documents sont maintenant stockés en JSON uniquement dans Cloud Storage.
     """
-    loader = FirestoreLoader(project_id=project_id)
+    loader = PipelineLoader(project_id=project_id, gcs_bucket_name=gcs_bucket_name)
     return loader.charger_documents(documents)
 
 
 if __name__ == "__main__":
-    # Test du module (nécessite des credentials GCP configurés)
-    print("Test du module de chargement Firestore...")
-    print("Note: Ce test nécessite des credentials GCP valides")
+    # Test du module (nécessite des credentials GCP configurés et un bucket GCS)
+    print("Test du module de chargement PipelineLoader (Cloud Storage JSON)...")
+    print("Note: Ce test nécessite des credentials GCP valides et un bucket GCS nommé 'documents-fiscaux-bucket'")
 
     # Créer un document de test
     document_test = {
-        "document_id": "TEST-DOC-0",
-        "contenu": "Ceci est un document de test pour vérifier le chargement dans Firestore.",
-        "titre_source": "Document de Test",
-        "source_url": "https://example.com/test",
-        "taille_caracteres": 70
+        "document_id": "TEST-DOC-JSON-0",
+        "contenu": "Ceci est un document de test pour vérifier le chargement JSON dans Cloud Storage. Tout est dans un seul fichier JSON.",
+        "titre_source": "Document de Test JSON",
+        "source_url": "https://example.com/test-json",
+        "taille_caracteres": 100  # Cette taille sera dans les métadonnées Firestore
     }
 
     try:
-        loader = FirestoreLoader()
+        # Assurez-vous que le bucket existe ou créez-le manuellement dans GCP
+        # loader = PipelineLoader()
+        # Pour le test, on peut spécifier un project_id et un bucket_name si besoin
+        loader = PipelineLoader(project_id=os.environ.get("PROJECT_ID"),
+                                gcs_bucket_name="documents-fiscaux-bucket-test")
 
         # Charger le document de test
+        print("\nChargement du document de test...")
         resultat = loader.charger_documents([document_test])
-        print(f"\n Test réussi : {resultat} document chargé")
+        print(f"\n✅ Test de chargement réussi : {resultat} document traité")
+
+        # Lire le document depuis GCS (simulé)
+        print("\nLecture du document depuis GCS (via loader.gcs_loader)...")
+        contenu_lu = loader.gcs_loader.lire_document("TEST-DOC-0")
+        print(f"Contenu lu depuis GCS: {contenu_lu[:50]}...")
 
         # Obtenir les statistiques
         stats = loader.obtenir_statistiques()
 
         # Nettoyer (supprimer le document de test)
-        print("\n Nettoyage...")
-        loader.supprimer_anciens_documents("https://example.com/test")
+        print("\n🧹 Nettoyage...")
+        loader.supprimer_anciens_documents("https://example.com/test-gcs")
 
     except Exception as e:
-        print(f"\n Erreur lors du test : {e}")
-        print("Assurez-vous que les credentials GCP sont configurés correctement")
+        print(f"\n❌ Erreur lors du test : {e}")
+        print("Assurez-vous que les credentials GCP sont configurés correctement et que le bucket GCS existe.")

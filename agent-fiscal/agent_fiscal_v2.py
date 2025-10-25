@@ -1,342 +1,396 @@
-"""
-Agent Fiscal V2 - Adapté pour utiliser la nouvelle collection de documents complets.
-Version optimisée pour le RAG avec recherche sur documents sémantiques.
-"""
+import json
+import os
+import re
+from datetime import datetime
+from typing import List, Dict, Optional
 
 import functions_framework
-from flask import jsonify
-from google.cloud import firestore
+import numpy as np
 import vertexai
+from flask import jsonify
+from google.cloud import storage
 from vertexai.generative_models import GenerativeModel
-import os
-from typing import List, Dict
-import re  # Importation pour le nettoyage du contenu
+from vertexai.language_models import TextEmbeddingModel
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("PROJECT_ID", "agent-gcp-f6005")
 LOCATION = "us-west1"
+BUCKET_NAME = os.environ.get("BUCKET_NAME", "documents-fiscaux-bucket")
 
-# --- Initialisation ---
+# Initialisation Vertex AI
 vertexai.init(project=PROJECT_ID, location=LOCATION)
-db = firestore.Client()
+
+# Clients Google Cloud
+storage_client = storage.Client()
+
+# Modèles IA
 model = GenerativeModel("gemini-2.0-flash")
+embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
 
-# --- Paramètres de recherche ---
-MAX_DOCUMENTS = 4  # Nombre maximum de documents à récupérer
+# --- Paramètres optimisés ---
+MAX_DOCUMENTS = 3
+MIN_SIMILARITY_SCORE = 0.3
+MAX_CONTEXT_LENGTH = 3000
 
-# --- Prompt système ---
-PROMPT_SYSTEME = """Tu es un assistant fiscal expert spécialisé dans la fiscalité des PME françaises.
-
-OBJECTIF : Fournir des réponses COURTES, CLAIRES et BIEN STRUCTURÉES.
-
-RÈGLES STRICTES :
-1. Base tes réponses EXCLUSIVEMENT sur les documents fournis.
-2. Sois CONCIS : maximum 200 mots pour la réponse principale.
-3. Structure ta réponse avec :
-   - Un titre principal (##)
-   - Une définition courte et claire
-   - Des points clés en gras (**texte**)
-   - Des listes à puces (-) pour les éléments multiples
-4. Ne répète JAMAIS le contenu brut du contexte.
-5. Synthétise intelligemment les informations.
-6. À la fin, cite 1-2 sources maximum : [Titre](URL)
-
-EXEMPLE DE BONNE RÉPONSE (COURTE ET STRUCTURÉE) :
-
-## La TVA (Taxe sur la Valeur Ajoutée)
-
-**Définition** : La TVA est un impôt indirect sur la consommation.
-
-**Taux en France** :
-- **20%** : Taux normal
-- **10%** : Taux intermédiaire (restauration, travaux)
-- **5,5%** : Taux réduit (produits de première nécessité)
-
-**Qui est concerné** : Toutes les entreprises réalisant des ventes de biens ou services, sauf régime micro-entreprise sous certains seuils.
-
-**Source** : [TVA - Service Public](https://entreprendre.service-public.fr/vosdroits/F23566)
-
----
-
-CONTEXTE DOCUMENTAIRE :
-{contexte}
-
-QUESTION : {question}
-
-RÉPONSE (COURTE ET STRUCTURÉE) :"""
+# Cache intelligent
+_documents_cache = []
+_cache_timestamp = None
+CACHE_DURATION_SECONDS = 3600
+_embeddings_cache = {}
 
 
-def extraire_mots_cles(question: str) -> List[str]:
-    """
-    Extrait les mots-clés pertinents avec normalisation améliorée.
-    """
-    # Mots vides français
-    mots_vides = {
-        'le', 'la', 'les', 'un', 'une', 'des', 'de', 'du', 'au', 'aux',
-        'et', 'ou', 'mais', 'donc', 'or', 'ni', 'car',
-        'je', 'tu', 'il', 'elle', 'nous', 'vous', 'ils', 'elles',
-        'mon', 'ma', 'mes', 'ton', 'ta', 'tes', 'son', 'sa', 'ses',
-        'ce', 'cet', 'cette', 'ces',
-        'qui', 'que', 'quoi', 'dont', 'où',
-        'est', 'sont', 'être', 'avoir', 'faire',
-        'pour', 'dans', 'sur', 'avec', 'sans', 'sous', 'par',
-        'quoi', 'quel', 'quelle', 'quels', 'quelles',
-        'comment', 'combien', 'pourquoi', 'quand',
-        'c', 'qu', 'd', 'l', 's', 't', 'n', 'm'
-    }
+def charger_documents_depuis_gcs() -> List[Dict]:
+    """Charge tous les documents fiscaux depuis Cloud Storage avec cache."""
+    global _documents_cache, _cache_timestamp
 
-    # Normaliser
-    question_lower = question.lower()
+    now = datetime.now().timestamp()
+    if _documents_cache and _cache_timestamp:
+        if (now - _cache_timestamp) < CACHE_DURATION_SECONDS:
+            print(f"✅ Cache ({len(_documents_cache)} docs)")
+            return _documents_cache
 
-    # Remplacer les abréviations courantes
-    question_lower = question_lower.replace("qw", "quoi").replace("qqw", "quoi")
+    print(f"📥 Chargement depuis gs://{BUCKET_NAME}...")
+    documents = []
 
-    mots = question_lower.split()
+    try:
+        bucket = storage_client.bucket(BUCKET_NAME)
+        blobs = bucket.list_blobs(prefix="documents/")
 
-    # Filtrer
-    mots_cles = []
-    for mot in mots:
-        mot_clean = ''.join(c for c in mot if c.isalnum() or c in ['é', 'è', 'ê', 'à', 'â', 'ù', 'û', 'ô', 'î', 'ç'])
+        for blob in blobs:
+            if not blob.name.endswith('.json'):
+                continue
+            try:
+                content = blob.download_as_text(encoding='utf-8')
+                doc = json.loads(content)
+                doc['type'] = 'local'
+                doc['gcs_path'] = f"gs://{BUCKET_NAME}/{blob.name}"
+                documents.append(doc)
+            except Exception as e:
+                print(f"⚠️ Erreur {blob.name}: {e}")
 
-        # Garder les mots de 2 caractères ou plus (pour "is", "ir", "tva")
-        if mot_clean and mot_clean not in mots_vides and len(mot_clean) >= 2:
-            mots_cles.append(mot_clean)
+        _documents_cache = documents
+        _cache_timestamp = now
+        print(f"✅ {len(documents)} documents chargés")
 
-    return mots_cles
+    except Exception as e:
+        print(f"❌ Erreur GCS: {e}")
+
+    return documents
 
 
-def rechercher_documents(question: str, max_documents: int = MAX_DOCUMENTS) -> List[Dict]:
-    """
-    Recherche améliorée avec scoring plus flexible.
-    """
-    print(f"\n🔍 Recherche de documents pour : '{question}'")
+def obtenir_embedding(texte: str) -> Optional[np.ndarray]:
+    """Génère un embedding vectoriel avec cache."""
+    if texte in _embeddings_cache:
+        return _embeddings_cache[texte]
 
-    # Extraire les mots-clés
-    mots_cles = extraire_mots_cles(question)
-    print(f"   📋 Mots-clés extraits : {mots_cles}")
+    try:
+        if len(texte) > 5000:
+            texte = texte[:2000] + " ... " + texte[-2000:]
 
-    if not mots_cles:
-        print("    ⚠️ Aucun mot-clé pertinent trouvé")
+        embeddings = embedding_model.get_embeddings([texte])
+        vector = np.array(embeddings[0].values)
+        _embeddings_cache[texte] = vector
+        return vector
+    except Exception as e:
+        print(f"⚠️ Embedding error: {e}")
+        return None
+
+
+def calculer_similarite_cosinus(vec1: np.ndarray, vec2: np.ndarray) -> float:
+    """Calcule la similarité cosinus entre deux vecteurs."""
+    try:
+        dot = np.dot(vec1, vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+
+        return float(dot / (norm1 * norm2))
+    except Exception as e:
+        print(f"⚠️ Similarité error: {e}")
+        return 0.0
+
+
+def rechercher_documents_semantique(question: str, max_docs: int = MAX_DOCUMENTS) -> List[Dict]:
+    """Recherche sémantique pure basée sur embeddings."""
+    print(f"\n🧠 Recherche: '{question}'")
+
+    q_embedding = obtenir_embedding(question)
+    if q_embedding is None:
+        print("❌ Impossible de générer embedding")
         return []
 
-    # Recherche dans Firestore
-    collection_ref = db.collection("documents_fiscaux_complets")
+    all_docs = charger_documents_depuis_gcs()
+    if not all_docs:
+        print("⚠️ Aucun document")
+        return []
 
-    documents_trouves = []
+    print(f"📚 Analyse de {len(all_docs)} documents...")
 
-    # Récupérer tous les documents
-    all_documents = collection_ref.limit(500).stream()
+    docs_scores = []
+    for doc in all_docs:
+        titre = doc.get('titre_source', '')
+        contenu = doc.get('contenu', '')
 
-    for doc in all_documents:
-        doc_data = doc.to_dict()
-        contenu = doc_data.get('contenu', '').lower()
-        titre = doc_data.get('titre_source', '').lower()
+        # Titre x3 + début contenu
+        texte_emb = f"{titre}. {titre}. {titre}. {contenu[:1000]}"
 
-        # Calculer un score avec pondération intelligente
-        score = 0
-        for mot_cle in mots_cles:
-            # Super bonus si dans le titre
-            if mot_cle in titre:
-                score += 10
+        doc_emb = obtenir_embedding(texte_emb)
+        if doc_emb is None:
+            continue
 
-            # Bonus pour occurrences dans le contenu
-            occurrences = contenu.count(mot_cle)
-            score += min(occurrences, 5)  # Limiter à 5 points max par mot
+        score = calculer_similarite_cosinus(q_embedding, doc_emb)
 
-        if score > 0:
-            doc_data['score'] = score
-            documents_trouves.append(doc_data)
+        if score >= MIN_SIMILARITY_SCORE:
+            doc['score'] = score
+            doc['score_type'] = 'semantique'
+            docs_scores.append(doc)
 
-    # Trier par score
-    documents_trouves.sort(key=lambda x: x['score'], reverse=True)
+    docs_scores.sort(key=lambda x: x['score'], reverse=True)
+    resultats = docs_scores[:max_docs]
 
-    # Limiter au nombre demandé
-    documents_pertinents = documents_trouves[:max_documents]
+    print(f"✅ {len(resultats)} doc(s) pertinent(s)")
+    for i, doc in enumerate(resultats, 1):
+        titre = doc.get('titre_source', 'Sans titre')[:60]
+        print(f"   {i}. [{doc['score'] * 100:.1f}%] {titre}")
 
-    print(f"   ✅ {len(documents_pertinents)} document(s) trouvé(s)")
-    for i, doc in enumerate(documents_pertinents, 1):
-        print(f"      {i}. Score {doc['score']}: {doc.get('titre_source', 'Sans titre')[:60]}...")
-
-    return documents_pertinents
+    return resultats
 
 
-def nettoyer_contenu(texte: str) -> str:
-    """
-    Nettoie le contenu en gardant SEULEMENT le texte utile et le formatage Markdown.
-    """
-    # Supprimer les références de citation entre crochets [Source](URL)
-    texte = re.sub(r'\[([^\]]+)\]\(https?://[^)]+\)', r'\1', texte)
-
-    # Supprimer les URLs complètes qui restent
+def nettoyer_contenu(texte: str, max_len: int = 1000) -> str:
+    """Nettoie et limite le contenu."""
     texte = re.sub(r'https?://[^\s\)]+', '', texte)
+    texte = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', texte)
+    texte = re.sub(r' +', ' ', texte)
+    texte = re.sub(r'\n\s*\n\s*\n+', '\n\n', texte)
 
-    # Supprimer les ### multiples (nettoyer les titres mal formés)
-    texte = re.sub(r'#{4,}', '###', texte)
+    if len(texte) > max_len:
+        texte = texte[:max_len]
+        point = texte.rfind('.')
+        if point > max_len * 0.7:
+            texte = texte[:point + 1]
+        else:
+            texte = texte + "..."
 
-    # Limiter le contenu à 2000 caractères pour éviter les contextes trop longs
-    if len(texte) > 2000:
-        texte = texte[:2000] + "..."
-
-    # Nettoyer les espaces multiples
-    texte = re.sub(r'\s+', ' ', texte).strip()
-
-    return texte
+    return texte.strip()
 
 
 def construire_contexte(documents: List[Dict]) -> str:
-    """
-    Construit le contexte textuel à partir des documents trouvés.
-
-    Args:
-        documents: Liste de documents pertinents
-
-    Returns:
-        Texte formaté du contexte
-    """
+    """Construit un contexte optimisé pour le LLM."""
     if not documents:
-        return "Aucun document pertinent trouvé."
+        return "Aucun document."
 
-    contexte_parts = []
+    parts = []
+    total = 0
 
     for i, doc in enumerate(documents, 1):
+        if total >= MAX_CONTEXT_LENGTH:
+            break
+
         titre = doc.get('titre_source', 'Sans titre')
-        url = doc.get('source_url', 'URL non disponible')
+        url = doc.get('source_url', '')
         contenu = doc.get('contenu', '')
 
-        # Nettoyer le contenu avant de l'ajouter au contexte
-        contenu_nettoye = nettoyer_contenu(contenu)
+        contenu_clean = nettoyer_contenu(contenu, 800)
 
-        contexte_parts.append(f"""
---- Document {i} ---
-Titre: {titre}
-Source: {url}
-Contenu:
-{contenu_nettoye}
-""")
+        doc_text = f"[Doc {i}]\nTitre: {titre}\nURL: {url}\nContenu: {contenu_clean}\n"
 
-    return "\n".join(contexte_parts)
+        if total + len(doc_text) > MAX_CONTEXT_LENGTH:
+            contenu_clean = nettoyer_contenu(contenu, 400)
+            doc_text = f"[Doc {i}]\nTitre: {titre}\nURL: {url}\nContenu: {contenu_clean}\n"
+
+        parts.append(doc_text)
+        total += len(doc_text)
+
+    return "\n---\n".join(parts)
+
+
+PROMPT_SYSTEME = """Tu es un expert fiscal français. Réponds de manière CONCISE et STRUCTURÉE.
+
+⚠️ RÈGLES :
+1. Maximum 150 mots
+2. Utilise UNIQUEMENT les documents fournis
+3. Structure : Titre ## + Définition + Points clés + Source
+
+📋 FORMAT :
+
+## [Titre]
+
+**Définition** : [1 phrase claire]
+
+**Points clés** :
+- Point 1
+- Point 2
+- Point 3
+
+**Source** : [Titre](URL)
+
+📄 DOCUMENTS :
+{contexte}
+
+❓ QUESTION : {question}
+
+💬 RÉPONSE :"""
 
 
 def generer_reponse(question: str, contexte: str) -> str:
-    """
-    Génère une réponse en utilisant le modèle LLM avec le contexte fourni.
-
-    Args:
-        question: La question de l'utilisateur
-        contexte: Le contexte documentaire
-
-    Returns:
-        La réponse générée
-    """
-    print(f"\n Génération de la réponse avec le modèle LLM...")
-
-    # Construire le prompt complet
-    prompt = PROMPT_SYSTEME.format(
-        contexte=contexte,
-        question=question
-    )
+    """Génère une réponse intelligente."""
+    prompt = PROMPT_SYSTEME.format(contexte=contexte, question=question)
 
     try:
-        # Appeler le modèle
-        response = model.generate_content(prompt)
-        reponse_text = response.text
+        print("\n💭 Génération réponse...")
 
-        print(f"   Réponse générée ({len(reponse_text)} caractères)")
-        return reponse_text
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                'temperature': 0.3,
+                'top_p': 0.8,
+                'top_k': 20,
+                'max_output_tokens': 500,
+            }
+        )
+
+        reponse = response.text
+        print("✅ Réponse générée")
+        return reponse
 
     except Exception as e:
-        print(f" Erreur lors de la génération : {e}")
-        raise
+        print(f"❌ Erreur LLM: {e}")
+        return "Désolé, erreur lors de la génération."
+
+
+def extraire_sources(documents: List[Dict]) -> List[Dict]:
+    """Extrait les sources."""
+    sources = []
+    for doc in documents[:3]:
+        sources.append({
+            "titre": doc.get('titre_source', 'Sans titre'),
+            "url": doc.get('source_url', ''),
+            "type": doc.get('type', 'local'),
+            "score": round(doc.get('score', 0), 2)
+        })
+    return sources
 
 
 @functions_framework.http
 def agent_fiscal(request):
-    """
-    Point d'entrée de la Cloud Function.
-    Reçoit une question et retourne une réponse basée sur les documents de la base de connaissances.
-    """
-    # Gérer CORS
+    """Point d'entrée HTTP pour l'agent fiscal."""
     if request.method == 'OPTIONS':
         headers = {
             'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'POST',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Max-Age': '3600'
         }
         return ('', 204, headers)
 
-    headers = {
-        'Access-Control-Allow-Origin': '*'
-    }
+    headers = {'Access-Control-Allow-Origin': '*'}
+
+    request_json = request.get_json(silent=True)
+    if not request_json or 'question' not in request_json:
+        return jsonify({
+            "erreur": "Format invalide"
+        }), 400, headers
+
+    question = request_json['question']
+
+    print(f"\n{'=' * 80}")
+    print(f"📥 Question: {question}")
+    print(f"{'=' * 80}")
 
     try:
-        # Récupérer la question
-        request_json = request.get_json(silent=True)
+        # Recherche sémantique
+        docs = rechercher_documents_semantique(question, MAX_DOCUMENTS)
 
-        if not request_json or 'question' not in request_json:
-            return jsonify({
-                "erreur": "Aucune question fournie. Utilisez le format: {\"question\": \"votre question\"}"
-            }), 400, headers
-
-        question = request_json['question']
-        print(f"\n{'=' * 80}")
-        print(f" Question reçue : {question}")
-        print(f"{'=' * 80}")
-
-        # ÉTAPE 1: Rechercher les documents pertinents
-        documents = rechercher_documents(question)
-
-        if not documents:
+        if not docs:
             return jsonify({
                 "question": question,
-                "reponse": "Je n'ai pas trouvé d'information pertinente dans ma base de connaissances pour répondre à cette question.",
+                "reponse": "## Aucun document\n\nDésolé, aucune information pertinente trouvée.",
+                "sources": [],
                 "documents_trouves": 0
             }), 200, headers
 
-        # ÉTAPE 2: Construire le contexte
-        contexte = construire_contexte(documents)
+        # Construire contexte
+        contexte = construire_contexte(docs)
+        print(f"\n📄 Contexte: {len(contexte)} chars")
 
-        # ÉTAPE 3: Générer la réponse
+        # Générer réponse
         reponse = generer_reponse(question, contexte)
 
-        # Retourner la réponse
-        return jsonify({
+        # Extraire sources
+        sources = extraire_sources(docs)
+
+        # Réponse finale
+        response_data = {
             "question": question,
             "reponse": reponse,
-            "documents_trouves": len(documents),
-            "sources": [
-                {
-                    "titre": doc.get('titre_source'),
-                    "url": doc.get('source_url')
-                }
-                for doc in documents[:3]  # Retourner les 3 sources principales
-            ]
-        }), 200, headers
+            "sources": sources,
+            "documents_trouves": len(docs),
+            "methode_recherche": "semantique",
+            "score_moyen": round(sum(d['score'] for d in docs) / len(docs), 2),
+            "meilleur_score": round(docs[0]['score'], 2)
+        }
+
+        print(f"\n✅ Succès")
+        print(f"   📊 Documents: {len(docs)}")
+        print(f"   🎯 Score: {response_data['meilleur_score'] * 100:.1f}%")
+        print(f"{'=' * 80}\n")
+
+        return jsonify(response_data), 200, headers
 
     except Exception as e:
-        print(f"\n ERREUR: {e}")
+        print(f"\n❌ ERREUR: {e}")
+        import traceback
+        traceback.print_exc()
+
         return jsonify({
-            "erreur": "Erreur lors de la génération de la réponse.",
-            "details": str(e)
+            "erreur": "Erreur serveur",
+            "details": str(e),
+            "question": question
         }), 500, headers
 
 
 if __name__ == "__main__":
-    # Test local
-    print("Test local de l'agent fiscal V2...")
+    print("\n🧪 TEST LOCAL\n")
 
-    question_test = "C'est quoi la TVA ?"
+    questions = [
+        "C'est quoi la TVA ?",
+        "Quel est le taux de l'impôt sur les sociétés ?",
+    ]
 
-    print(f"\nQuestion de test : {question_test}")
+    for i, q in enumerate(questions, 1):
+        print(f"\n{'=' * 80}")
+        print(f"TEST {i}: {q}")
+        print(f"{'=' * 80}")
 
-    # Simuler la recherche
-    documents = rechercher_documents(question_test)
 
-    if documents:
-        contexte = construire_contexte(documents)
-        print(f"\nContexte construit ({len(contexte)} caractères)")
-        print("\nPremiers 500 caractères du contexte:")
-        print("-" * 80)
-        print(contexte[:500])
-        print("-" * 80)
-    else:
-        print("\n  Aucun document trouvé")
+        class MockRequest:
+            def get_json(self, silent):
+                return {'question': q}
+
+            method = 'POST'
+
+
+        try:
+            resp, status, headers = agent_fiscal(MockRequest())
+            data = resp.json
+
+            print(f"\n✅ Status: {status}")
+            print(f"   Docs: {data.get('documents_trouves', 0)}")
+            print(f"\n📝 RÉPONSE:\n{data.get('reponse', 'N/A')}")
+
+            if data.get('sources'):
+                print(f"\n📚 SOURCES:")
+                for j, src in enumerate(data['sources'], 1):
+                    print(f"   {j}. {src.get('titre', 'N/A')} ({src.get('score', 0)})")
+
+        except Exception as e:
+            print(f"\n❌ Erreur: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+    print(f"\n{'=' * 80}")
+    print("✅ Tests terminés")
+    print(f"{'=' * 80}\n")

@@ -1,17 +1,13 @@
-"""
-Point d'entrée principal pour Google Cloud Functions
-Importe la fonction surveiller_sites depuis pipeline.py
-"""
+import os
+from typing import List, Dict
 
 import functions_framework
 from google.cloud import firestore
-from typing import List, Dict
-import os
 
 # Import des modules ETL
 from extract import ContentExtractor
-from transform import ContentProcessor  # Changement ici
-from load import FirestoreLoader
+from load import PipelineLoader
+from transform import ContentProcessor
 
 
 class VeillePipeline:
@@ -25,9 +21,10 @@ class VeillePipeline:
         self.project_id = project_id or os.environ.get("PROJECT_ID")
 
         # Initialiser les composants du pipeline
-        self.extractor = ContentExtractor(timeout=10, delay_between_requests=0.2)
-        self.processor = ContentProcessor()  # Changement ici
-        self.loader = FirestoreLoader(project_id=self.project_id)
+        self.extractor = ContentExtractor()  # Utilise Custom Search API uniquement
+        self.processor = ContentProcessor()
+        # Utilise le PipelineLoader qui stocke en JSON dans Cloud Storage
+        self.loader = PipelineLoader(project_id=self.project_id, gcs_bucket_name="documents-fiscaux-bucket")
 
         # Client Firestore pour lire les sources à surveiller
         if self.project_id:
@@ -58,54 +55,57 @@ class VeillePipeline:
 
     def traiter_source(self, source: Dict) -> int:
         """
-        Traite une source complète : extraction, transformation et chargement.
+        Traite une source complète : extraction via Custom Search API, transformation et chargement.
 
         Args:
             source: Dictionnaire contenant les informations de la source
-                    Doit contenir au minimum 'url_base'
+                    Doit contenir : id, keywords (ou description), url_base (optionnel), categorie
 
         Returns:
             Nombre de documents créés et chargés
         """
-        url_base = source.get("url_base")
         source_id = source.get("id", "unknown")
 
-        if not url_base:
-            print(f" Source {source_id} n'a pas d'url_base, ignorée")
-            return 0
-
         print("\n" + "=" * 80)
-        print(f" TRAITEMENT DE LA SOURCE: {source_id}")
-        print(f"   URL: {url_base}")
+        print(f"📋 TRAITEMENT DE LA SOURCE: {source_id}")
         print("=" * 80)
 
-        # PHASE 1: EXTRACT - Extraire le contenu
-        print("\n PHASE 1: EXTRACTION")
-        document_extrait = self.extractor.extraire_contenu(url_base)
+        # PHASE 1: EXTRACT - Extraire via Custom Search API
+        print("\n🔍 PHASE 1: EXTRACTION (Custom Search API)")
+        documents_extraits = self.extractor.extraire_pour_source(source)
 
-        if not document_extrait:
-            print(f" Échec de l'extraction pour {url_base}")
+        if not documents_extraits:
+            print(f"⚠️ Aucun document extrait pour {source_id}")
             return 0
 
-        # PHASE 2: TRANSFORM - Traiter le document (anciennement découper en chunks)
-        print("\n  PHASE 2: TRAITEMENT (Pas de découpage, document complet)")
-        documents_traites = self.processor.traiter_document(document_extrait)  # Changement ici
+        print(f"✅ {len(documents_extraits)} document(s) extrait(s)")
+
+        # PHASE 2: TRANSFORM - Traiter les documents
+        print("\n🔄 PHASE 2: TRANSFORMATION")
+        documents_traites = []
+        for doc_extrait in documents_extraits:
+            docs_transformes = self.processor.traiter_document(doc_extrait)
+            if docs_transformes:
+                documents_traites.extend(docs_transformes)
 
         if not documents_traites:
-            print(f" Aucun document traité pour {url_base}")
+            print(f"⚠️ Aucun document traité pour {source_id}")
             return 0
 
-        # PHASE 3: LOAD - Charger dans Firestore
-        print("\n PHASE 3: CHARGEMENT")
+        print(f"✅ {len(documents_traites)} document(s) traité(s)")
 
-        # Option: Supprimer les anciens documents de cette URL avant de charger les nouveaux
-        # Cela garantit que les données sont toujours à jour
-        self.loader.supprimer_anciens_documents(url_base)  # Changement ici
+        # PHASE 3: LOAD - Charger en JSON dans Cloud Storage
+        print("\n💾 PHASE 3: CHARGEMENT (Cloud Storage JSON)")
 
-        documents_charges = self.loader.charger_documents(documents_traites)  # Changement ici
+        # Supprimer les anciens documents de cette source
+        url_base = source.get("url_base", "")
+        if url_base:
+            self.loader.supprimer_anciens_documents(url_base)
+
+        documents_charges = self.loader.charger_documents(documents_traites)
 
         print("\n" + "=" * 80)
-        print(f" SOURCE {source_id} TRAITÉE: {documents_charges} document(s) chargé(s)")
+        print(f"✅ SOURCE {source_id} TRAITÉE: {documents_charges} document(s) chargé(s)")
         print("=" * 80)
 
         return documents_charges
@@ -130,11 +130,11 @@ class VeillePipeline:
                 "status": "warning",
                 "message": "Aucune source à surveiller",
                 "sources_traitees": 0,
-                "documents_crees": 0  # Changement ici
+                "documents_crees": 0
             }
 
         # Traiter chaque source
-        total_documents = 0  # Changement ici
+        total_documents = 0
         sources_reussies = 0
 
         for i, source in enumerate(sources, 1):
@@ -143,8 +143,8 @@ class VeillePipeline:
             print(f"{'=' * 80}")
 
             try:
-                documents_count = self.traiter_source(source)  # Changement ici
-                total_documents += documents_count  # Changement ici
+                documents_count = self.traiter_source(source)
+                total_documents += documents_count
                 if documents_count > 0:
                     sources_reussies += 1
             except Exception as e:
@@ -157,7 +157,7 @@ class VeillePipeline:
         print("🎉" * 40)
         print(f"\n RÉSUMÉ:")
         print(f"   Sources traitées avec succès: {sources_reussies}/{len(sources)}")
-        print(f"   Total de documents créés: {total_documents}")  # Changement ici
+        print(f"   Total de documents créés: {total_documents}")
 
         # Obtenir les statistiques finales de la base
         stats_finales = self.loader.obtenir_statistiques()
@@ -167,7 +167,7 @@ class VeillePipeline:
             "message": "Pipeline exécuté avec succès",
             "sources_traitees": sources_reussies,
             "sources_total": len(sources),
-            "documents_crees": total_documents,  # Changement ici
+            "documents_crees": total_documents,
             "statistiques_base": stats_finales
         }
 
@@ -196,7 +196,9 @@ def surveiller_sites(request):
 
 # Fonction pour exécution locale
 def executer_pipeline_local():
-    """Exécute le pipeline localement pour tests."""
+    """
+    Exécute le pipeline localement pour tests.
+    """
     pipeline = VeillePipeline()
     resultat = pipeline.executer()
     return resultat
