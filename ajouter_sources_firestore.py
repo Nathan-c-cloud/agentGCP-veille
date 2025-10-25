@@ -13,11 +13,11 @@ from datetime import datetime
 
 def ajouter_sources():
     """Ajoute les 10 sources fiscales essentielles dans Firestore."""
-    
+
     # Initialiser le client Firestore
     # Dans Cloud Shell, les credentials sont automatiquement configurés
     db = firestore.Client()
-    
+
     # Définir les 10 sources à ajouter
     sources = [
         {
@@ -111,30 +111,30 @@ def ajouter_sources():
             "date_ajout": datetime.now().strftime("%Y-%m-%d")
         }
     ]
-    
+
     # Référence à la collection
     collection_ref = db.collection("sources_a_surveiller")
-    
-    print("="*80)
+
+    print("=" * 80)
     print("AJOUT DES SOURCES FISCALES DANS FIRESTORE")
-    print("="*80)
+    print("=" * 80)
     print(f"\nProjet: {db.project}")
     print(f"Collection: sources_a_surveiller")
     print(f"Nombre de sources à ajouter: {len(sources)}")
-    print("\n" + "-"*80)
-    
+    print("\n" + "-" * 80)
+
     # Ajouter chaque source
     sources_ajoutees = 0
     sources_existantes = 0
-    
+
     for i, source in enumerate(sources, 1):
         source_id = source.pop("id")  # Retirer l'ID des données
-        
+
         try:
             # Vérifier si la source existe déjà
             doc_ref = collection_ref.document(source_id)
             doc = doc_ref.get()
-            
+
             if doc.exists:
                 print(f"\n[{i}/{len(sources)}] ⚠️  Source '{source_id}' existe déjà")
                 print(f"         URL: {source['url_base']}")
@@ -148,31 +148,31 @@ def ajouter_sources():
                 print(f"         URL: {source['url_base']}")
                 print(f"         Catégorie: {source['categorie']}")
                 sources_ajoutees += 1
-                
+
         except Exception as e:
             print(f"\n[{i}/{len(sources)}] ❌ Erreur pour '{source_id}': {e}")
-    
+
     # Résumé
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("RÉSUMÉ")
-    print("="*80)
+    print("=" * 80)
     print(f"✅ Sources ajoutées avec succès: {sources_ajoutees}")
     print(f"⚠️  Sources déjà existantes: {sources_existantes}")
     print(f"📊 Total dans la collection: {sources_ajoutees + sources_existantes}")
-    
+
     if sources_ajoutees > 0:
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("PROCHAINE ÉTAPE")
-        print("="*80)
+        print("=" * 80)
         print("\nPour extraire le contenu de ces sources, exécutez le pipeline de veille:")
         print("\n  curl -X POST \"https://surveiller-sites-VOTRE_ID.us-west1.run.app\"")
         print("\nOu si vous l'avez déployé :")
         print("\n  gcloud functions call surveiller-sites --region=us-west1 --gen2")
         print("\nCela créera environ 70 chunks dans la collection 'documents_fiscaux_chunks'.")
-    
-    print("\n" + "="*80)
+
+    print("\n" + "=" * 80)
     print("✅ SCRIPT TERMINÉ")
-    print("="*80)
+    print("=" * 80)
 
 
 if __name__ == "__main__":
@@ -186,5 +186,5 @@ if __name__ == "__main__":
         print("  3. L'API Firestore est activée")
         print("  4. Vous avez les permissions nécessaires")
         import traceback
-        traceback.print_exc()
 
+        traceback.print_exc()

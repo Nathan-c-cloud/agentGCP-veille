@@ -1,6 +1,5 @@
 """
-Agent Fiscal V2 - Adapté pour utiliser la nouvelle collection de chunks
-Version optimisée pour le RAG avec recherche sur chunks sémantiques.
+Agent Client - Orchestrateur intelligent pour routage vers agents spécialisés
 """
 
 import functions_framework
@@ -9,7 +8,8 @@ from google.cloud import firestore
 import vertexai
 from vertexai.generative_models import GenerativeModel
 import os
-from typing import List, Dict
+import requests
+from typing import List, Dict, Tuple
 
 
 # --- Configuration ---
@@ -19,174 +19,148 @@ LOCATION = "us-west1"
 # --- Initialisation ---
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 db = firestore.Client()
-model = GenerativeModel("gemini-2.0-flash")
+model = GenerativeModel("gemini-2.0-flash-exp")  # Modèle rapide pour classification
 
-# --- Paramètres de recherche ---
-AGENTS_DISPONIBLES = [
-    "fiscalite",
-    "comptabilite",
-    "ressources_humaines",
-    "support_technique"
-]
+# --- Configuration des agents spécialisés ---
+AGENTS_CONFIG = {
+    "fiscalite": {
+        "url": "https://us-west1-agent-gcp-f6005.cloudfunctions.net/agent-fiscal-v2",
+        "description": "Questions sur la fiscalité (TVA, IS, IR, CFE, taxes, impôts)"
+    },
+    "comptabilite": {
+        "url": None,  # À implémenter
+        "description": "Questions sur la comptabilité, bilans, comptes"
+    },
+    "ressources_humaines": {
+        "url": None,  # À implémenter
+        "description": "Questions sur les RH, contrats, paie, social"
+    },
+    "juridique": {
+        "url": None,  # À implémenter
+        "description": "Questions juridiques, droit des sociétés"
+    }
+}
 
-# --- Prompt système ---
-PROMPT_SYSTEME = """
-Tu es l'Agent Client, un LLM central jouant le rôle d'orchestrateur intelligent entre plusieurs agents spécialisés 
-(fiscal, comptable, administratif, juridique, intégrateur, conseiller, etc.).
+# --- Prompt de classification ---
+PROMPT_CLASSIFICATION = """Tu es un classificateur de questions pour un système multi-agents.
 
-TA MISSION :
-- Comprendre la demande du client.
-- Identifier quel(s) agent(s) spécialisé(s) sont les plus pertinents pour y répondre.
-- Formuler des requêtes claires et contextualisées à ces agents.
-- Synthétiser et restituer la réponse finale au client de manière cohérente, fluide et professionnelle.
+Analyse la question de l'utilisateur et identifie quel agent spécialisé doit y répondre.
 
-RÈGLES STRICTES :
-1. Ne formule pas toi-même une réponse d'expert (fiscalité, comptabilité, etc.) si elle doit provenir d’un autre agent.
-2. Si une demande nécessite plusieurs agents, coordonne leur exécution et fusionne leurs résultats.
-3. Si aucune information n’est disponible ou si aucun agent n’est compétent, réponds :
-   "Je n’ai pas trouvé cette information dans ma base de connaissances actuelle."
-4. Cite toujours la ou les sources des informations (titre et URL) lorsque tu t’appuies sur des documents de contexte.
-5. Sois précis, clair, professionnel et structuré dans tes réponses au client.
-6. Si plusieurs agents te transmettent des informations complémentaires, synthétise-les avec cohérence et logique métier.
-7. Maintiens un ton empathique et humain — tu es le point de contact principal du client, pas un simple relais technique.
+AGENTS DISPONIBLES :
+- fiscalite : TVA, impôts, IS, IR, CFE, taxes, déclarations fiscales
+- comptabilite : Comptabilité, bilans, comptes, écritures comptables
+- ressources_humaines : RH, contrats, paie, congés, droit du travail
+- juridique : Droit des sociétés, contrats commerciaux, aspects juridiques
 
-BUT FINAL :
-Assurer une expérience fluide, fiable et transparente entre le client et les différents agents, 
-tout en garantissant la qualité et la traçabilité des informations.
+RÈGLES :
+1. Réponds UNIQUEMENT par le nom de l'agent (ex: "fiscalite")
+2. Si la question n'est pas pertinente, réponds "non_pertinent"
+3. Ne donne AUCUNE explication, juste le nom de l'agent
 
----
+QUESTION : {question}
 
-CONTEXTE DOCUMENTAIRE :
-{contexte}
+AGENT :"""
 
 
-QUESTION DE L'UTILISATEUR :
-{question}
-
-LISTE DES AGENTS DISPONIBLES :
-{AGENTS_DISPONIBLES}
-
-RÉPONSE :
-"""
-
-def classifier_intention(question: str) -> str:
+def classifier_question(question: str) -> Tuple[str, float]:
     """
-    Classifie la question pour déterminer l'agent de destination.
-    
-    Args:
-        question: La question de l'utilisateur
-        
+    Classifie la question pour identifier l'agent cible.
+
     Returns:
-        Le nom de l'agent de destination (e.g., 'fiscalite', 'non_pertinent')
+        Tuple (nom_agent, confiance) où confiance est un score 0-1
     """
-    print(f"\n🧠 Classification de l'intention pour : '{question}'")
-    
-    # Construire le prompt complet
-    prompt = PROMPT_SYSTEME.format(question=question)
-    
+    print(f"\n🧠 Classification de la question...")
+
+    prompt = PROMPT_CLASSIFICATION.format(question=question)
+
     try:
-        # Appeler le modèle
-        # Utiliser un modèle rapide pour la classification
-        response = model.generate_content(prompt) 
-        
-        # Nettoyer la réponse (le modèle ne devrait répondre que par le nom de l'agent)
+        response = model.generate_content(prompt)
         agent_cible = response.text.strip().lower()
         
-        # Vérifier si l'agent cible fait partie de la liste ou est 'non_pertinent'
-        if agent_cible not in AGENTS_DISPONIBLES and agent_cible != 'non_pertinent':
-             # Si le modèle hallucine, forcer une valeur de sécurité
-             return "non_pertinent"
-        
-        print(f"   ✅ Agent cible identifié : {agent_cible}")
-        return agent_cible
-        
+        # Validation
+        if agent_cible in AGENTS_CONFIG:
+            print(f"   ✅ Agent identifié : {agent_cible}")
+            return agent_cible, 0.9
+        elif agent_cible == "non_pertinent":
+            print(f"   ⚠️ Question non pertinente")
+            return "non_pertinent", 0.8
+        else:
+            print(f"   ⚠️ Classification incertaine : {agent_cible}")
+            # Par défaut, essayer l'agent fiscal
+            return "fiscalite", 0.5
+
     except Exception as e:
-        print(f"   ❌ Erreur lors de la classification : {e}")
-        return "erreur_interne"
+        print(f"   ❌ Erreur lors de la classification : {e}")
+        return "fiscalite", 0.3  # Fallback vers fiscal
 
 
-def extraire_mots_cles(question: str) -> List[str]:
+def appeler_agent_specialise(agent_name: str, question: str) -> Dict:
     """
-    Extrait les mots-clés pertinents d'une question.
-    Version améliorée avec normalisation et filtrage.
-    
+    Appelle un agent spécialisé via HTTP.
+
     Args:
-        question: La question de l'utilisateur
-        
+        agent_name: Nom de l'agent (ex: 'fiscalite')
+        question: Question de l'utilisateur
+
     Returns:
-        Liste de mots-clés normalisés
+        Réponse de l'agent sous forme de dict
     """
-    # Mots vides français à ignorer
-    mots_vides = {
-        'le', 'la', 'les', 'un', 'une', 'des', 'de', 'du', 'au', 'aux',
-        'et', 'ou', 'mais', 'donc', 'or', 'ni', 'car',
-        'je', 'tu', 'il', 'elle', 'nous', 'vous', 'ils', 'elles',
-        'mon', 'ma', 'mes', 'ton', 'ta', 'tes', 'son', 'sa', 'ses',
-        'ce', 'cet', 'cette', 'ces',
-        'qui', 'que', 'quoi', 'dont', 'où',
-        'est', 'sont', 'être', 'avoir', 'faire',
-        'pour', 'dans', 'sur', 'avec', 'sans', 'sous', 'par',
-        'quoi', 'quel', 'quelle', 'quels', 'quelles',
-        'comment', 'combien', 'pourquoi', 'quand',
-        'c', 'qu', 'd', 'l', 's', 't', 'n', 'm'
-    }
-    
-    # Normaliser et découper
-    question_lower = question.lower()
-    mots = question_lower.split()
-    
-    # Filtrer et nettoyer
-    mots_cles = []
-    for mot in mots:
-        # Retirer la ponctuation
-        mot_clean = ''.join(c for c in mot if c.isalnum() or c in ['é', 'è', 'ê', 'à', 'â', 'ù', 'û', 'ô', 'î', 'ç'])
-        
-        # Garder seulement si pas un mot vide et assez long
-        if mot_clean and mot_clean not in mots_vides and len(mot_clean) >= 3:
-            mots_cles.append(mot_clean)
-    
-    return mots_cles
+    print(f"\n Appel de l'agent '{agent_name}'...")
 
+    agent_config = AGENTS_CONFIG.get(agent_name)
 
+    if not agent_config or not agent_config["url"]:
+        return {
+            "erreur": f"L'agent '{agent_name}' n'est pas encore disponible.",
+            "reponse": "Désolé, cette fonctionnalité n'est pas encore implémentée."
+        }
 
-
-def generer_reponse(question: str, contexte: str) -> str:
-    """
-    Génère une réponse en utilisant le modèle LLM avec le contexte fourni.
-    
-    Args:
-        question: La question de l'utilisateur
-        contexte: Le contexte documentaire
-        
-    Returns:
-        La réponse générée
-    """
-    print(f"\n🤖 Génération de la réponse avec le modèle LLM...")
-    
-    # Construire le prompt complet
-    prompt = PROMPT_SYSTEME.format(
-        contexte=contexte,
-        question=question
-    )
-    
     try:
-        # Appeler le modèle
-        response = model.generate_content(prompt)
-        reponse_text = response.text
-        
-        print(f"   ✅ Réponse générée ({len(reponse_text)} caractères)")
-        return reponse_text
-        
+        # Appel HTTP POST à l'agent
+        response = requests.post(
+            agent_config["url"],
+            json={"question": question},
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            print(f"   ✅ Réponse reçue de l'agent ({len(data.get('reponse', ''))} caractères)")
+            return data
+        else:
+            print(f"   ❌ Erreur HTTP {response.status_code}")
+            return {
+                "erreur": f"Erreur de l'agent : {response.status_code}",
+                "reponse": "Désolé, une erreur est survenue lors du traitement de votre demande."
+            }
+
+    except requests.exceptions.Timeout:
+        print(f"  Timeout de l'agent")
+        return {
+            "erreur": "Timeout",
+            "reponse": "La requête a pris trop de temps. Veuillez réessayer."
+        }
     except Exception as e:
-        print(f"   ❌ Erreur lors de la génération : {e}")
-        raise
+        print(f"   Erreur lors de l'appel : {e}")
+        return {
+            "erreur": str(e),
+            "reponse": "Désolé, une erreur technique est survenue."
+        }
+
+
+def synthese_reponse(question: str, agent_name: str, reponse_agent: str) -> str:
+    """
+    Optionnel : Améliore/synthétise la réponse de l'agent si nécessaire.
+    Pour l'instant, on retourne directement la réponse de l'agent.
+    """
+    return reponse_agent
 
 
 @functions_framework.http
 def agent_client(request):
     """
-    Point d'entrée de l'agent client.
-    Reçoit une question et retourne la question à l'agent apte à répondre et retourne la réponse de cette agent.
+    Point d'entrée de l'agent client orchestrateur.
     """
     # Gérer CORS
     if request.method == 'OPTIONS':
@@ -207,50 +181,72 @@ def agent_client(request):
         
         if not request_json or 'question' not in request_json:
             return jsonify({
-                "erreur": "Aucune question fournie. Utilisez le format: {\"question\": \"votre question\"}"
+                "erreur": "Aucune question fournie. Format attendu: {\"question\": \"votre question\"}"
             }), 400, headers
         
         question = request_json['question']
         print(f"\n{'='*80}")
-        print(f"📨 Question reçue : {question}")
+        print(f" Question reçue : {question}")
         print(f"{'='*80}")
         
-        # ÉTAPE 1: Identifier le thème 
-        
-        
-        # ÉTAPE 2: Rediriger la question au bon agent 
-        
-        # ÉTAPE 3: Générer la réponse de l'agent 
-        
-        # Etape 4 : Retourner la réponse de l'agent avec les sources
-        
-        
-    except Exception as e:
-        print(f"\n❌ ERREUR: {e}")
+        # ÉTAPE 1: Classifier la question
+        agent_cible, confiance = classifier_question(question)
+
+        if agent_cible == "non_pertinent":
+            return jsonify({
+                "question": question,
+                "agent_utilise": "aucun",
+                "reponse": "Je ne suis pas sûr de comprendre votre question. Pourriez-vous reformuler ou préciser votre demande concernant la fiscalité, la comptabilité ou les ressources humaines ?",
+                "confiance": confiance
+            }), 200, headers
+
+        # ÉTAPE 2: Appeler l'agent spécialisé
+        reponse_agent = appeler_agent_specialise(agent_cible, question)
+
+        # ÉTAPE 3: Préparer la réponse finale
+        if "erreur" in reponse_agent and reponse_agent.get("reponse") == "Désolé, cette fonctionnalité n'est pas encore implémentée.":
+            # Agent pas encore disponible
+            return jsonify({
+                "question": question,
+                "agent_utilise": agent_cible,
+                "reponse": f"Je comprends que votre question concerne le domaine '{agent_cible}', mais cet agent n'est pas encore disponible. Pour l'instant, seul l'agent fiscal est opérationnel.",
+                "agent_disponible": False
+            }), 200, headers
+
+        # ÉTAPE 4: Retourner la réponse complète
         return jsonify({
-            "erreur": "Erreur lors de la génération de la réponse.",
+            "question": question,
+            "agent_utilise": agent_cible,
+            "reponse": reponse_agent.get("reponse", "Aucune réponse générée"),
+            "sources": reponse_agent.get("sources", []),
+            "documents_trouves": reponse_agent.get("documents_trouves", 0),
+            "confiance": confiance
+        }), 200, headers
+
+    except Exception as e:
+        print(f"\n❌ ERREUR GLOBALE: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "erreur": "Erreur interne du serveur",
             "details": str(e)
         }), 500, headers
 
 
 if __name__ == "__main__":
     # Test local
-    print("Test local de l'agent client V2...")
-    
-    question_test = "C'est quoi la TVA ?"
-    
-    print(f"\nQuestion de test : {question_test}")
-    
-    # Simuler la recherche
-    chunks = rechercher_chunks(question_test)
-    
-    if chunks:
-        contexte = construire_contexte(chunks)
-        print(f"\nContexte construit ({len(contexte)} caractères)")
-        print("\nPremiers 500 caractères du contexte:")
-        print("-"*80)
-        print(contexte[:500])
-        print("-"*80)
-    else:
-        print("\n⚠️  Aucun chunk trouvé")
+    print("🧪 Test local de l'agent client orchestrateur...\n")
 
+    questions_test = [
+        "C'est quoi la TVA ?",
+        "Comment calculer l'impôt sur les sociétés ?",
+        "Quel est le taux de la CFE ?"
+    ]
+
+    for question in questions_test:
+        print(f"\n{'='*80}")
+        print(f"Test : {question}")
+        print(f"{'='*80}")
+
+        agent, confiance = classifier_question(question)
+        print(f"Résultat : {agent} (confiance: {confiance})")
