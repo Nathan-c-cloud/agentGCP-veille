@@ -20,6 +20,8 @@ vertexai.init(project=PROJECT_ID, location=LOCATION)
 db = firestore.Client()  # (optionnel, non utilisé ici)
 model = GenerativeModel("gemini-2.0-flash")
 
+
+
 # --- Agents disponibles ---
 AGENTS_DISPONIBLES = [
     "fiscalite",
@@ -91,6 +93,127 @@ def classifier_intention(question: str) -> str:
     except Exception as e:
         print(f"❌ Erreur lors de la classification : {e}")
         return "erreur_interne"
+
+
+def llm_route(question: str, registry: Dict[str, Dict]) -> Tuple[Optional[str], float, str]:
+    """
+    Classement LLM : demande à Gemini de choisir l'agent. Renvoie (agent, confidence, reason).
+    """
+    labels = [
+        {"id": a, "name": meta["display_name"], "desc": meta.get("description", "")}
+        for a, meta in registry.items()
+    ]
+    if not labels:
+        return None, 0.0, "Aucun agent disponible dans le registre."
+
+    sys = (
+        "Tu es un routeur d'intentions. Choisis **un seul** agent parmi la liste.\n"
+        "Réponds **exclusivement** en JSON strict: {\"agent\":\"id\",\"confidence\":0-1,\"reason\":\"...\"}.\n"
+        "Si aucun ne convient, utilise agent=\"none\" et confidence proche de 0."
+    )
+    catalog = "\n".join([f"- id={x['id']} | {x['name']}: {x['desc']}" for x in labels])
+    prompt = f"""{sys}
+
+Catalogue:
+{catalog}
+
+Question:
+{question}
+"""
+
+    try:
+        resp = llm.generate_content(prompt)
+        txt = (resp.text or "").strip()
+        # Rattrapage: extraire JSON
+        start = txt.find("{")
+        end = txt.rfind("}")
+        if start >= 0 and end > start:
+            txt = txt[start:end+1]
+        data = json.loads(txt)
+        agent = data.get("agent")
+        conf = float(data.get("confidence", 0.0))
+        reason = data.get("reason", "")
+        if agent == "none":
+            return None, conf, reason
+        if agent not in registry:
+            return None, conf, f"Agent '{agent}' inconnu. {reason}"
+        return agent, conf, reason
+    except Exception as e:
+        return None, 0.0, f"Erreur LLM: {e}"
+
+def choose_agent(question: str, registry: Dict[str, Dict]) -> Dict:
+    """
+    Choix final de l'agent : règles d'abord, LLM ensuite si nécessaire.
+    Retourne un dict avec agent_id, confidence, method, debug.
+    """
+    # 1) Règles rapides
+    rules_agent, rules_conf, rules_detail = rules_score(question, registry)
+
+    # Si assez bon, on route tout de suite
+    if rules_agent and rules_conf >= ROUTING_CONFIDENCE_GOOD:
+        return {
+            "agent_id": rules_agent,
+            "confidence": round(rules_conf, 3),
+            "method": "rules",
+            "debug": {"rules_points": rules_detail}
+        }
+
+    # 2) LLM pour départager / sauver un cas ambigü
+    llm_agent, llm_conf, llm_reason = llm_route(question, registry)
+
+    # Fusion simple : on garde le meilleur score
+    cand = []
+    if rules_agent:
+        cand.append(("rules", rules_agent, rules_conf))
+    if llm_agent:
+        cand.append(("llm", llm_agent, llm_conf))
+
+    if not cand:
+        # Rien trouvé
+        return {
+            "agent_id": None,
+            "confidence": 0.0,
+            "method": "none",
+            "debug": {"rules_points": rules_detail, "llm_reason": llm_reason}
+        }
+
+    best = max(cand, key=lambda x: x[2])
+    method, agent_id, conf = best
+
+    return {
+        "agent_id": agent_id,
+        "confidence": round(conf, 3),
+        "method": method,
+        "debug": {
+            "rules_points": rules_detail,
+            "llm_reason": llm_reason
+        }
+    }
+
+def forward_to_agent(endpoint_url: str, question: str, routing_meta: Dict]) -> Tuple[int, Dict]:
+    """
+    Appelle l'agent cible en POST JSON.
+    Retourne (status_code, payload_json)
+    """
+    payload = {
+        "question": question,
+        "router": {
+            "selected_agent": routing_meta.get("agent_id"),
+            "confidence": routing_meta.get("confidence"),
+            "method": routing_meta.get("method"),
+            "debug": routing_meta.get("debug", {})
+        }
+    }
+    r = requests.post(
+        endpoint_url,
+        json=payload,
+        timeout=ROUTING_TIMEOUT_SEC,
+        headers={"Content-Type": "application/json"}
+    )
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"raw": r.text}
 
 def extraire_mots_cles(question: str) -> List[str]:
     mots_vides = {
