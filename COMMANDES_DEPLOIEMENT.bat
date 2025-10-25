@@ -8,16 +8,23 @@ echo DEPLOIEMENT SYSTEME COMPLET - AGENT MULTI-SPECIALISE
 echo ==========================================
 echo.
 
-REM Configuration
-set PROJECT_ID=agent-gcp-f6005
-set REGION=us-west1
-set BUCKET_NAME=documents-fiscaux-bucket
+REM Charger les variables depuis le fichier .env
+if not exist ".env" (
+    echo ERREUR: Fichier .env introuvable a la racine du projet !
+    echo Creez un fichier .env avec vos cles API.
+    pause
+    exit /b 1
+)
 
-REM API Keys Google Custom Search (obligatoires pour le pipeline)
-REM Obtenir GOOGLE_API_KEY : https://console.cloud.google.com/apis/credentials
-REM Obtenir SEARCH_ENGINE_ID : https://programmablesearchengine.google.com/
-set GOOGLE_API_KEY=AIzaSyBCN4MsvWWi0NNSrH0r2dLtyuunwoGhtls
-set SEARCH_ENGINE_ID=661bbd25e96d644f7
+echo Chargement des variables depuis .env...
+for /f "usebackq tokens=1,2 delims==" %%a in (".env") do (
+    if not "%%a"=="" if not "%%a:~0,1%"=="#" (
+        set %%a=%%b
+    )
+)
+
+REM Configuration
+set REGION=us-west1
 
 REM Vérifier le projet
 echo Configuration du projet...
@@ -128,4 +135,5 @@ echo   1. Ajouter les sources: python ajouter_sources_firestore.py
 echo   2. Executer le pipeline pour creer les documents
 echo   3. Tester l'agent client avec votre frontend
 echo.
-ENDLOCAL
+
+pause
