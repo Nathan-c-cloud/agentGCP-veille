@@ -36,8 +36,12 @@ AGENTS_CONFIG = {
         "description": "Questions sur les RH, contrats, paie, social"
     },
     "juridique": {
-        "url": None,  # À implémenter
+        "url": "https://agent-juridique-478570587937.us-west1.run.app",
         "description": "Questions juridiques, droit des sociétés"
+    },
+    "aides": {
+        "url": "https://agent-aides-478570587937.us-west1.run.app",  # À implémenter
+        "description": "Questions sur les aides publiques et subventions"
     }
 }
 
@@ -51,6 +55,7 @@ AGENTS DISPONIBLES :
 - comptabilite : Comptabilité, bilans, comptes, écritures comptables
 - ressources_humaines : RH, contrats, paie, congés, droit du travail
 - juridique : Droit des sociétés, contrats commerciaux, aspects juridiques
+- aides : Aides publiques, subventions, financements
 
 RÈGLES :
 1. Réponds UNIQUEMENT par le nom de l'agent (ex: "fiscalite")
