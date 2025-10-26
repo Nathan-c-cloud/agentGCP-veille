@@ -6,94 +6,63 @@ from google.genai import types
 
 app = Flask(__name__)
 
-# --- 1. Initialisation du Client (depuis VOTRE script) ---
-try:
-    client = genai.Client(vertexai=True)
-except Exception as e:
-    print(f"Erreur init client genai: {e}")
+# --- Configuration ---
+PROJECT_ID = os.environ.get("PROJECT_ID", "agent-gcp-f6005")
+LOCATION = os.environ.get("LOCATION", "us-west1")
 
-# --- 2. Définition du Prompt (Votre prompt, NETTOYÉ) ---
-# J'ai retiré la section "Profil entreprise à utiliser" avec les {{placeholders}}
-# car ces informations doivent être dans la question de l'utilisateur.
+# --- Définition du Prompt ---
 SI_TEXT_AIDES = """Tu es un Agent_Aides. Ta mission : identifier et résumer les aides publiques pertinentes pour une entreprise française (nationales, régionales, européennes), et fournir une sortie JSON strictement conforme au schéma.
 
+**Instructions strictes :**
+1. Analysez la question de l'utilisateur.
+2. Fondez votre réponse **uniquement** sur les informations présentes dans le contexte récupéré.
+3. Si le contexte ne contient pas la réponse, indiquez "Je ne trouve pas d'aides correspondantes dans ma base de connaissances."
+4. Ne jamais utiliser vos connaissances générales, utiliser l'ancrage pour fiabilisé votre réponse.
+5. Citez vos sources en vous basant sur le contexte.
+6. Répondez au format JSON structuré.
+
+Tu FOURNIS : (1) une liste des AIDES IDENTIFIÉES, (2) les CRITÈRES D'ÉLIGIBILITÉ,
+(3) les MONTANTS et MODALITÉS, (4) les SOURCES OFFICIELLES (titre + URL), (5) un DISCLAIMER final
+
 Contraintes :
-- Réponses factuelles et à jour. Appuie-toi sur les sources ancrées (Vertex AI Search) et sur la recherche Google si activée.
-- Adapte la pertinence selon le profil (secteur, taille, localisation, âge de l’entreprise, CA).
-- Si l’information est incertaine (montant, date limite…), indique \"unknown\" et détaille la raison dans \"notes\".
-- Donne 3 à 8 aides max, ordonnées par score de pertinence décroissant.
-- Toujours remplir \"sources\" avec titre + URL, une par aide min.
-- Respecte STRICTEMENT le schéma JSON fourni (pas de texte hors JSON).
+- Ne pas donner de conseil personnalisé.
+- Si la demande n'est PAS du périmètre des aides publiques,
+ renvoie handoff.needed=true, target_agent ∈ {"fiscal","juridique","social","rh"},
+ reason explicite, et laisse aides_identifiees/sources vides.
+- Toujours répondre en JSON valide selon le schéma."""
 
-Consigne de pertinence (score 0–1) :
-- +0.4 si l’aide cible explicitement le secteur de l’entreprise
-- +0.3 si la région/département correspond
-- +0.2 si taille/âge/forme juridique correspondent
-- −0.3 si cumul d’incompatibilités détectées
-
-Quand tu ne trouves pas d’aide pertinente : renvoie un tableau vide et \"explanation\" décrivant pourquoi (ex : critères trop vagues).
-
-Instructions: 1. Recherche dans TOUTES les sources disponibles 2. Priorise les aides les plus pertinentes selon le profil 3. Pour chaque aide, indique: - Nom officiel - Organisme porteur - Montant / taux - Critères d'éligibilité - Lien vers la page source 4. Classe par pertinence décroissante 5. Indique les démarches à suivre
-
-Exemples de requêtes :
-- \"Quelles subventions pour une PME industrielle en Île-de-France (30 pers), projet d’efficacité énergétique ?\"
-- \"Aides à l’embauche pour une TPE du numérique à Lyon (2 salariés, <2 ans).\"
-- \"Financements innovation DeepTech pour une SAS à Nantes.\"
-
-Comportement multi-agents (OBLIGATOIRE) :
-- Si la question n’entre PAS dans ton périmètre, NE réponds pas au fond.
- → Retourne un JSON avec :
-  \"handoff\": {
-   \"suggested_agent\": \"legal\" | \"fiscal\" | \"social\" | \"aides\" | \"none\",
-   \"reason\": \"…\",
-   \"confidence\": nombre entre 0 et 1
-  },
-  ET \"payload\" vide/partiel selon ton schéma.
-- Si la question ENTRE dans ton périmètre, réponds normalement ET mets :
- \"handoff\": { \"suggested_agent\": \"none\", \"reason\": \"\", \"confidence\": 1.0 }.
-- Tu DOIS toujours renvoyer un JSON valide conforme au schéma (Structured Output ON).
-- Pas de texte hors JSON.
-
-
-NE PRODUIS QUE DU JSON."""
-
-# --- 3. Définition des Outils (depuis VOTRE script) ---
-# C'est l'ancrage RAG sur votre Data Store Bpifrance
+# --- Définition des Outils ---
 DATASTORE_AIDES = "projects/agent-gcp-f6005/locations/global/collections/default_collection/dataStores/datastore-aides_1761090553437_gcs_store"
-tools = [
-    types.Tool(retrieval=types.Retrieval(vertex_ai_search=types.VertexAISearch(datastore=DATASTORE_AIDES))),
-]
 
-# --- 4. Définition de la Config (depuis VOTRE script) ---
+# --- Configuration de génération ---
 generate_content_config = types.GenerateContentConfig(
     temperature=0.2,
     top_p=0.95,
     seed=0,
     max_output_tokens=65535,
-    safety_settings=[types.SafetySetting(
-        category="HARM_CATEGORY_HATE_SPEECH",
-        threshold="OFF"
-    ), types.SafetySetting(
-        category="HARM_CATEGORY_DANGEROUS_CONTENT",
-        threshold="OFF"
-    ), types.SafetySetting(
-        category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-        threshold="OFF"
-    ), types.SafetySetting(
-        category="HARM_CATEGORY_HARASSMENT",
-        threshold="OFF"
-    )],
-    tools=tools,
+    safety_settings=[
+        types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
+        types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
+        types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
+        types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF")
+    ],
+    tools=[
+        types.Tool(
+            retrieval=types.Retrieval(
+                vertex_ai_search=types.VertexAISearch(datastore=DATASTORE_AIDES)
+            )
+        )
+    ],
     system_instruction=[types.Part.from_text(text=SI_TEXT_AIDES)],
-    thinking_config=types.ThinkingConfig(
-        thinking_budget=-1,
-    ),
+    thinking_config=types.ThinkingConfig(thinking_budget=-1),
 )
 
 
-# --- 5. L'endpoint API que votre Orchestrateur appellera ---
 @app.route("/query", methods=["POST"])
 def handle_query():
+    """
+    Endpoint API pour traiter les requêtes sur les aides.
+    """
     data = request.get_json()
     if "user_query" not in data:
         return jsonify({"error": "Missing 'user_query' in JSON payload"}), 400
@@ -101,18 +70,35 @@ def handle_query():
     user_query = data["user_query"]
     print(f"Agent Aides: Requête reçue: {user_query}")
 
-    # Le `contents` est maintenant dynamique, basé sur l'input de l'utilisateur
+    # Créer le client à l'intérieur de la fonction (évite les problèmes de lifecycle)
+    try:
+        print(f"Agent Aides: Initialisation du client genai...")
+        client = genai.Client(
+            vertexai=True,
+            project=PROJECT_ID,
+            location=LOCATION
+        )
+        print(f"Agent Aides: Client initialisé avec succès")
+
+    except Exception as e:
+        print(f"Erreur lors de l'initialisation du client genai: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "error": "Erreur d'initialisation du client",
+            "details": str(e)
+        }), 500
+
+    # Préparer le contenu de la requête
     contents = [
         types.Content(
             role="user",
-            parts=[
-                types.Part.from_text(text=user_query)  # Utiliser la query de l'utilisateur
-            ]
+            parts=[types.Part.from_text(text=user_query)]
         ),
     ]
 
     try:
-        # Nous utilisons generate_content (pas stream) pour une réponse API
+        # Appel de Gemini avec RAG
         print(f"Agent Aides: Appel de Gemini avec RAG...")
         response = client.models.generate_content(
             model="gemini-2.5-pro",
@@ -121,17 +107,66 @@ def handle_query():
         )
 
         print(f"Agent Aides: Réponse reçue de Gemini.")
+
         # Nettoyer la sortie de Gemini pour s'assurer que c'est du JSON valide
-        json_response_text = response.text.strip().lstrip("```json").rstrip("```")
+        json_response_text = response.text.strip()
+
+        # Retirer les balises markdown si présentes
+        if json_response_text.startswith("```json"):
+            json_response_text = json_response_text[7:]
+        if json_response_text.startswith("```"):
+            json_response_text = json_response_text[3:]
+        if json_response_text.endswith("```"):
+            json_response_text = json_response_text[:-3]
+
+        json_response_text = json_response_text.strip()
+
+        # Vérifier que c'est du JSON valide
+        try:
+            json_data = json.loads(json_response_text)
+            print(f"Agent Aides: Réponse JSON valide")
+        except json.JSONDecodeError as e:
+            print(f"Agent Aides: Réponse n'est pas du JSON valide: {e}")
+            print(f"Agent Aides: Réponse brute: {json_response_text[:200]}...")
+            # Retourner quand même la réponse brute
+            json_data = {"reponse_brute": json_response_text}
+
+        # Fermer explicitement le client
+        try:
+            client.close()
+        except:
+            pass
 
         # Renvoyer le JSON à l'Orchestrateur
-        return json_response_text, 200, {'Content-Type': 'application/json'}
+        return jsonify(json_data), 200
 
     except Exception as e:
         print(f"Erreur lors de la génération de contenu: {e}")
-        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+        import traceback
+        traceback.print_exc()
+
+        # Fermer le client en cas d'erreur
+        try:
+            client.close()
+        except:
+            pass
+
+        return jsonify({
+            "error": "Internal server error",
+            "details": str(e)
+        }), 500
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """
+    Endpoint de santé pour Cloud Run.
+    """
+    return jsonify({"status": "healthy"}), 200
 
 
 # Point d'entrée pour Gunicorn (utilisé par Cloud Run)
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    port = int(os.environ.get("PORT", 8080))
+    app.run(debug=True, host="0.0.0.0", port=port)
+
