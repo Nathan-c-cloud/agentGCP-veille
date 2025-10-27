@@ -471,18 +471,103 @@ def agent_fiscal(request):
     try:
         request_json = request.get_json(silent=True)
         if not request_json:
-            return jsonify({"erreur": "Format invalide"}), 400, headers
+            return jsonify({"erreur": "Format invalide - JSON requis"}), 400, headers
 
-        # Détecter le type de requête
+        # LOG COMPLET pour debug
+        print(f"\n{'=' * 80}")
+        print(f"📥 REQUÊTE REÇUE:")
+        print(json.dumps(request_json, indent=2, ensure_ascii=False))
+        print(f"{'=' * 80}\n")
+
+        # Détecter le type de requête de manière TRÈS flexible
+
+        # Format 1: {"task": "verify", "data": {...}}
         if 'task' in request_json and request_json['task'] == 'verify':
+            print("✅ Format détecté: task + data")
             return handle_verification(request_json, headers)
-        elif 'question' in request_json:
-            return handle_question(request_json, headers)
-        else:
-            return jsonify({
-                "erreur": "Format invalide. Attendu : {'question': '...'} ou {'task': 'verify', 'data': {...}}"
-            }), 400, headers
 
+        # Format 2: {"question": "..."}
+        elif 'question' in request_json:
+            print("✅ Format détecté: question")
+            return handle_question(request_json, headers)
+
+        # Format 3: {"settings": {...}} - Format du frontend !
+        elif 'settings' in request_json and isinstance(request_json['settings'], dict):
+            print("✅ Format détecté: settings wrapper (frontend)")
+            settings = request_json['settings']
+
+            # Extraire les données de la déclaration depuis settings
+            reformatted_request = {
+                'task': 'verify',
+                'data': settings,
+                'historical_data': request_json.get('historical_data') or settings.get('historical_data')
+            }
+            return handle_verification(reformatted_request, headers)
+
+        # Format 4: Direct TVA data - vérifier plusieurs variantes
+        elif any(key in request_json for key in ['tva_collectee', 'tva_deductible', 'tva_a_payer',
+                                                   'tvaCollectee', 'tvaDeductible', 'tvaAPayer']):
+            print("✅ Format détecté: données TVA directes")
+            # Normaliser les clés (camelCase -> snake_case)
+            normalized_data = {}
+            for key, value in request_json.items():
+                if key == 'tvaCollectee':
+                    normalized_data['tva_collectee'] = value
+                elif key == 'tvaDeductible':
+                    normalized_data['tva_deductible'] = value
+                elif key == 'tvaAPayer':
+                    normalized_data['tva_a_payer'] = value
+                elif key == 'historicalData':
+                    normalized_data['historical_data'] = value
+                else:
+                    normalized_data[key] = value
+
+            reformatted_request = {
+                'task': 'verify',
+                'data': normalized_data,
+                'historical_data': normalized_data.get('historical_data')
+            }
+            return handle_verification(reformatted_request, headers)
+
+        # Format 5: Données imbriquées dans "declaration"
+        elif 'declaration' in request_json:
+            print("✅ Format détecté: declaration wrapper")
+            reformatted_request = {
+                'task': 'verify',
+                'data': request_json['declaration'],
+                'historical_data': request_json.get('historical_data')
+            }
+            return handle_verification(reformatted_request, headers)
+
+        # Format 6: Données imbriquées dans "data"
+        elif 'data' in request_json and isinstance(request_json['data'], dict):
+            # Si 'data' est présent mais pas 'task', on suppose que c'est une vérification
+            if any(key in request_json['data'] for key in ['tva_collectee', 'tva_deductible', 'tva_a_payer',
+                                                             'tvaCollectee', 'tvaDeductible', 'tvaAPayer']):
+                print("✅ Format détecté: data wrapper sans task")
+                reformatted_request = {
+                    'task': 'verify',
+                    'data': request_json['data'],
+                    'historical_data': request_json.get('historical_data')
+                }
+                return handle_verification(reformatted_request, headers)
+
+        else:
+            print("❌ Format non reconnu")
+            print(f"Clés présentes: {list(request_json.keys())}")
+            return jsonify({
+                "erreur": "Format invalide",
+                "cles_recues": list(request_json.keys()),
+                "exemple_recu": request_json if len(str(request_json)) < 500 else "données trop longues",
+                "formats_acceptes": [
+                    {"question": "votre question fiscale"},
+                    {"task": "verify", "data": {"tva_collectee": 1000, "tva_deductible": 200, "tva_a_payer": 800}},
+                    {"settings": {"tva_collectee": 1000, "tva_deductible": 200, "tva_a_payer": 800}},
+                    {"tva_collectee": 1000, "tva_deductible": 200, "tva_a_payer": 800},
+                    {"tvaCollectee": 1000, "tvaDeductible": 200, "tvaAPayer": 800},
+                    {"declaration": {"tva_collectee": 1000, "tva_deductible": 200, "tva_a_payer": 800}}
+                ]
+            }), 400, headers
     except Exception as e:
         print(f"❌ Erreur globale: {e}")
         import traceback
