@@ -1,5 +1,6 @@
 """
 Agent Client - Orchestrateur intelligent pour routage vers agents spécialisés
+VERSION CORRIGÉE avec authentification service-to-service
 """
 
 import functions_framework
@@ -10,7 +11,9 @@ from vertexai.generative_models import GenerativeModel
 import os
 import requests
 from typing import List, Dict, Tuple
-
+import google.auth
+from google.auth.transport.requests import AuthorizedSession
+import json
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("PROJECT_ID", "agent-gcp-f6005")
@@ -19,25 +22,43 @@ LOCATION = "us-west1"
 # --- Initialisation ---
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 db = firestore.Client()
-model = GenerativeModel("gemini-2.0-flash-exp")  # Modèle rapide pour classification
+model = GenerativeModel("gemini-2.5-pro")
+
+# Initialiser les credentials pour l'authentification service-to-service
+try:
+    credentials, project = google.auth.default()
+    authed_session = AuthorizedSession(credentials)
+    print("✅ Credentials initialisés pour l'authentification service-to-service")
+except Exception as e:
+    print(f"⚠️ Erreur d'initialisation des credentials: {e}")
+    authed_session = None
 
 # --- Configuration des agents spécialisés ---
 AGENTS_CONFIG = {
     "fiscalite": {
         "url": "https://us-west1-agent-gcp-f6005.cloudfunctions.net/agent-fiscal-v2",
-        "description": "Questions sur la fiscalité (TVA, IS, IR, CFE, taxes, impôts)"
+        "description": "Questions sur la fiscalité (TVA, IS, IR, CFE, taxes, impôts)",
+        "requires_auth": False  # Cloud Function publique
     },
     "comptabilite": {
-        "url": None,  # À implémenter
-        "description": "Questions sur la comptabilité, bilans, comptes"
+        "url": None,
+        "description": "Questions sur la comptabilité, bilans, comptes",
+        "requires_auth": False
     },
     "ressources_humaines": {
-        "url": None,  # À implémenter
-        "description": "Questions sur les RH, contrats, paie, social"
+        "url": None,
+        "description": "Questions sur les RH, contrats, paie, social",
+        "requires_auth": False
     },
     "juridique": {
-        "url": None,  # À implémenter
-        "description": "Questions juridiques, droit des sociétés"
+        "url": "https://agent-juridique-478570587937.us-west1.run.app",
+        "description": "Questions juridiques, droit des sociétés",
+        "requires_auth": True  # Cloud Run avec authentification
+    },
+    "aides": {
+        "url": "https://agent-aides-478570587937.us-west1.run.app",
+        "description": "Questions sur les aides publiques et subventions",
+        "requires_auth": True  # Cloud Run avec authentification
     }
 }
 
@@ -51,6 +72,7 @@ AGENTS DISPONIBLES :
 - comptabilite : Comptabilité, bilans, comptes, écritures comptables
 - ressources_humaines : RH, contrats, paie, congés, droit du travail
 - juridique : Droit des sociétés, contrats commerciaux, aspects juridiques
+- aides : Aides publiques, subventions, financements
 
 RÈGLES :
 1. Réponds UNIQUEMENT par le nom de l'agent (ex: "fiscalite")
@@ -76,7 +98,7 @@ def classifier_question(question: str) -> Tuple[str, float]:
     try:
         response = model.generate_content(prompt)
         agent_cible = response.text.strip().lower()
-        
+
         # Validation
         if agent_cible in AGENTS_CONFIG:
             print(f"   ✅ Agent identifié : {agent_cible}")
@@ -86,26 +108,20 @@ def classifier_question(question: str) -> Tuple[str, float]:
             return "non_pertinent", 0.8
         else:
             print(f"   ⚠️ Classification incertaine : {agent_cible}")
-            # Par défaut, essayer l'agent fiscal
             return "fiscalite", 0.5
 
     except Exception as e:
         print(f"   ❌ Erreur lors de la classification : {e}")
-        return "fiscalite", 0.3  # Fallback vers fiscal
+        return "fiscalite", 0.3
 
 
 def appeler_agent_specialise(agent_name: str, question: str) -> Dict:
     """
-    Appelle un agent spécialisé via HTTP.
+    Appelle un agent spécialisé via HTTP avec authentification si nécessaire.
 
-    Args:
-        agent_name: Nom de l'agent (ex: 'fiscalite')
-        question: Question de l'utilisateur
-
-    Returns:
-        Réponse de l'agent sous forme de dict
+    CORRECTION PRINCIPALE : Utilise AuthorizedSession pour les services Cloud Run authentifiés.
     """
-    print(f"\n Appel de l'agent '{agent_name}'...")
+    print(f"\n📞 Appel de l'agent '{agent_name}'...")
 
     agent_config = AGENTS_CONFIG.get(agent_name)
 
@@ -116,45 +132,106 @@ def appeler_agent_specialise(agent_name: str, question: str) -> Dict:
         }
 
     try:
-        # Appel HTTP POST à l'agent
-        response = requests.post(
-            agent_config["url"],
-            json={"question": question},
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
+        base_url = agent_config["url"]
+        requires_auth = agent_config.get("requires_auth", False)
+
+        # Préparer l'URL et le payload selon le type d'agent
+        if agent_name in ["juridique", "aides"]:
+            # Agents Flask sur Cloud Run
+            url = f"{base_url}/query" if not base_url.endswith("/query") else base_url
+            payload = {"user_query": question}
+        else:
+            # Agent fiscal (Cloud Function)
+            url = base_url
+            payload = {"question": question}
+
+        print(f"   🌐 URL: {url}")
+        print(f"   📦 Payload: {payload}")
+        print(f"   🔒 Authentification requise: {requires_auth}")
+
+        # Faire la requête avec ou sans authentification
+        if requires_auth:
+            # Utiliser la session authentifiée pour Cloud Run
+            if authed_session is None:
+                print(f"   ❌ Session authentifiée non disponible")
+                return {
+                    "erreur": "Authentification non disponible",
+                    "reponse": "Impossible d'authentifier l'appel à l'agent sécurisé."
+                }
+
+            print(f"   🔑 Utilisation de l'authentification service-to-service...")
+            response = authed_session.post(url, json=payload, timeout=60)
+        else:
+            # Requête simple pour les services publics
+            headers = {"Content-Type": "application/json"}
+            response = requests.post(url, json=payload, headers=headers, timeout=60)
+
+        print(f"   📡 Status code: {response.status_code}")
 
         if response.status_code == 200:
-            data = response.json()
-            print(f"   ✅ Réponse reçue de l'agent ({len(data.get('reponse', ''))} caractères)")
-            return data
+            try:
+                data = response.json()
+
+                # Traiter la réponse selon le type d'agent
+                if agent_name in ["juridique", "aides"]:
+                    if isinstance(data, dict):
+                        # Extraire les informations pertinentes
+                        reponse_text = data.get("checklist", "") or data.get("aides_identifiees", "") or str(data)
+                        sources = data.get("sources", [])
+                        return {
+                            "reponse": json.dumps(data, indent=2, ensure_ascii=False),
+                            "sources": sources,
+                            "data_complete": data
+                        }
+                    else:
+                        return {"reponse": str(data), "sources": []}
+                else:
+                    # Agent fiscal
+                    if isinstance(data, dict) and "reponse" in data:
+                        print(f"   ✅ Réponse reçue ({len(data.get('reponse', ''))} caractères)")
+                        return data
+                    else:
+                        return {"reponse": str(data), "sources": []}
+
+            except ValueError as e:
+                print(f"   ⚠️ Réponse non-JSON: {e}")
+                return {"reponse": response.text, "sources": []}
+
+        elif response.status_code == 403:
+            print(f"   ❌ Erreur 403 Forbidden - Problème de permissions IAM")
+            print(f"   💡 Solution: Vérifiez que le service account a le rôle 'roles/run.invoker'")
+            return {
+                "erreur": "Accès refusé (403)",
+                "reponse": "L'agent client n'a pas les permissions pour accéder à cet agent. Vérifiez les permissions IAM."
+            }
+        elif response.status_code == 401:
+            print(f"   ❌ Erreur 401 Unauthorized - Problème d'authentification")
+            return {
+                "erreur": "Non autorisé (401)",
+                "reponse": "Erreur d'authentification lors de l'appel à l'agent."
+            }
         else:
             print(f"   ❌ Erreur HTTP {response.status_code}")
+            print(f"   📄 Réponse: {response.text[:200]}")
             return {
                 "erreur": f"Erreur de l'agent : {response.status_code}",
                 "reponse": "Désolé, une erreur est survenue lors du traitement de votre demande."
             }
 
     except requests.exceptions.Timeout:
-        print(f"  Timeout de l'agent")
+        print(f"   ⏱️ Timeout de l'agent")
         return {
             "erreur": "Timeout",
             "reponse": "La requête a pris trop de temps. Veuillez réessayer."
         }
     except Exception as e:
-        print(f"   Erreur lors de l'appel : {e}")
+        print(f"   ❌ Erreur lors de l'appel : {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "erreur": str(e),
             "reponse": "Désolé, une erreur technique est survenue."
         }
-
-
-def synthese_reponse(question: str, agent_name: str, reponse_agent: str) -> str:
-    """
-    Optionnel : Améliore/synthétise la réponse de l'agent si nécessaire.
-    Pour l'instant, on retourne directement la réponse de l'agent.
-    """
-    return reponse_agent
 
 
 @functions_framework.http
@@ -170,25 +247,25 @@ def agent_client(request):
             'Access-Control-Allow-Headers': 'Content-Type',
         }
         return ('', 204, headers)
-    
+
     headers = {
         'Access-Control-Allow-Origin': '*'
     }
-    
+
     try:
         # Récupérer la question
         request_json = request.get_json(silent=True)
-        
+
         if not request_json or 'question' not in request_json:
             return jsonify({
                 "erreur": "Aucune question fournie. Format attendu: {\"question\": \"votre question\"}"
             }), 400, headers
-        
+
         question = request_json['question']
         print(f"\n{'='*80}")
         print(f" Question reçue : {question}")
         print(f"{'='*80}")
-        
+
         # ÉTAPE 1: Classifier la question
         agent_cible, confiance = classifier_question(question)
 
@@ -196,7 +273,7 @@ def agent_client(request):
             return jsonify({
                 "question": question,
                 "agent_utilise": "aucun",
-                "reponse": "Je ne suis pas sûr de comprendre votre question. Pourriez-vous reformuler ou préciser votre demande concernant la fiscalité, la comptabilité ou les ressources humaines ?",
+                "reponse": "Je ne suis pas sûr de comprendre votre question. Pourriez-vous reformuler ou préciser votre demande concernant la fiscalité, la comptabilité, les ressources humaines, le juridique ou les aides ?",
                 "confiance": confiance
             }), 200, headers
 
@@ -205,11 +282,10 @@ def agent_client(request):
 
         # ÉTAPE 3: Préparer la réponse finale
         if "erreur" in reponse_agent and reponse_agent.get("reponse") == "Désolé, cette fonctionnalité n'est pas encore implémentée.":
-            # Agent pas encore disponible
             return jsonify({
                 "question": question,
                 "agent_utilise": agent_cible,
-                "reponse": f"Je comprends que votre question concerne le domaine '{agent_cible}', mais cet agent n'est pas encore disponible. Pour l'instant, seul l'agent fiscal est opérationnel.",
+                "reponse": f"Je comprends que votre question concerne le domaine '{agent_cible}', mais cet agent n'est pas encore disponible.",
                 "agent_disponible": False
             }), 200, headers
 
@@ -220,7 +296,8 @@ def agent_client(request):
             "reponse": reponse_agent.get("reponse", "Aucune réponse générée"),
             "sources": reponse_agent.get("sources", []),
             "documents_trouves": reponse_agent.get("documents_trouves", 0),
-            "confiance": confiance
+            "confiance": confiance,
+            "data_complete": reponse_agent.get("data_complete")
         }), 200, headers
 
     except Exception as e:
@@ -240,7 +317,8 @@ if __name__ == "__main__":
     questions_test = [
         "C'est quoi la TVA ?",
         "Comment calculer l'impôt sur les sociétés ?",
-        "Quel est le taux de la CFE ?"
+        "Quelles sont les aides pour une PME innovante ?",
+        "Comment créer une SAS ?"
     ]
 
     for question in questions_test:
@@ -248,5 +326,17 @@ if __name__ == "__main__":
         print(f"Test : {question}")
         print(f"{'='*80}")
 
+        # ÉTAPE 1: Classification
         agent, confiance = classifier_question(question)
-        print(f"Résultat : {agent} (confiance: {confiance})")
+        print(f"Classification : {agent} (confiance: {confiance})")
+
+        # ÉTAPE 2: Appel de l'agent spécialisé
+        reponse = appeler_agent_specialise(agent, question)
+        print(f"\n📝 Réponse de l'agent '{agent}':")
+        if "erreur" in reponse:
+            print(f"   ❌ Erreur: {reponse['erreur']}")
+        if "reponse" in reponse:
+            print(f"   💬 {reponse['reponse'][:200]}...")
+        if "sources" in reponse:
+            print(f"   📚 Sources: {len(reponse['sources'])} document(s)")
+

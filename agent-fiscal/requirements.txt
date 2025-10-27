@@ -1,6 +1,3 @@
-# Dépendances pour l'agent fiscal conversationnel
-
-# Cloud Functions Framework
 functions-framework==3.*
 
 # Google Cloud
