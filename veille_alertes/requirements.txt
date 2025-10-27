@@ -1,0 +1,14 @@
+# Dépendances minimales pour la veille automatique
+
+# Cloud Functions Framework
+functions-framework==3.*
+
+# Google Cloud
+google-cloud-firestore==2.*
+
+# HTTP requests
+requests==2.31.*
+
+# Flask (utilisé par functions-framework)
+flask==3.*
+
