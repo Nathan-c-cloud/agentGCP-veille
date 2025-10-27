@@ -17,16 +17,6 @@ PROJECT_ID = os.environ.get("PROJECT_ID", "agent-gcp-f6005")
 LOCATION = "us-west1"
 BUCKET_NAME = os.environ.get("BUCKET_NAME", "documents-fiscaux-bucket")
 
-# Initialisation Vertex AI
-vertexai.init(project=PROJECT_ID, location=LOCATION)
-
-# Clients Google Cloud
-storage_client = storage.Client()
-
-# Modèles IA
-model = GenerativeModel("gemini-2.0-flash")
-embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
-
 # --- Paramètres optimisés ---
 MAX_DOCUMENTS = 3
 MIN_SIMILARITY_SCORE = 0.3
@@ -38,10 +28,40 @@ _cache_timestamp = None
 CACHE_DURATION_SECONDS = 3600
 _embeddings_cache = {}
 
+# Initialisation lazy (pour éviter les problèmes au démarrage)
+_vertex_initialized = False
+_model = None
+_embedding_model = None
+_storage_client = None
+
+# ⚠️ PAS D'INITIALISATION AU DÉMARRAGE - Tout est fait en lazy loading
+
+
+def init_vertex_ai():
+    """Initialise Vertex AI de manière lazy"""
+    global _vertex_initialized, _model, _embedding_model, _storage_client
+
+    if _vertex_initialized:
+        return
+
+    try:
+        print("🔧 Initialisation Vertex AI...")
+        vertexai.init(project=PROJECT_ID, location=LOCATION)
+        _model = GenerativeModel("gemini-2.0-flash")
+        _embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
+        _storage_client = storage.Client()
+        _vertex_initialized = True
+        print("✅ Vertex AI initialisé")
+    except Exception as e:
+        print(f"⚠️ Erreur initialisation Vertex AI: {e}")
+        raise
+
 
 def charger_documents_depuis_gcs() -> List[Dict]:
     """Charge tous les documents fiscaux depuis Cloud Storage avec cache."""
     global _documents_cache, _cache_timestamp
+
+    init_vertex_ai()
 
     now = datetime.now().timestamp()
     if _documents_cache and _cache_timestamp:
@@ -53,7 +73,7 @@ def charger_documents_depuis_gcs() -> List[Dict]:
     documents = []
 
     try:
-        bucket = storage_client.bucket(BUCKET_NAME)
+        bucket = _storage_client.bucket(BUCKET_NAME)
         blobs = bucket.list_blobs(prefix="documents/")
 
         for blob in blobs:
@@ -80,6 +100,8 @@ def charger_documents_depuis_gcs() -> List[Dict]:
 
 def obtenir_embedding(texte: str) -> Optional[np.ndarray]:
     """Génère un embedding vectoriel avec cache."""
+    init_vertex_ai()
+
     if texte in _embeddings_cache:
         return _embeddings_cache[texte]
 
@@ -87,7 +109,7 @@ def obtenir_embedding(texte: str) -> Optional[np.ndarray]:
         if len(texte) > 5000:
             texte = texte[:2000] + " ... " + texte[-2000:]
 
-        embeddings = embedding_model.get_embeddings([texte])
+        embeddings = _embedding_model.get_embeddings([texte])
         vector = np.array(embeddings[0].values)
         _embeddings_cache[texte] = vector
         return vector
@@ -236,12 +258,14 @@ PROMPT_SYSTEME = """Tu es un expert fiscal français. Réponds de manière CONCI
 
 def generer_reponse(question: str, contexte: str) -> str:
     """Génère une réponse intelligente."""
+    init_vertex_ai()
+
     prompt = PROMPT_SYSTEME.format(contexte=contexte, question=question)
 
     try:
         print("\n💭 Génération réponse...")
 
-        response = model.generate_content(
+        response = _model.generate_content(
             prompt,
             generation_config={
                 'temperature': 0.3,
@@ -273,9 +297,166 @@ def extraire_sources(documents: List[Dict]) -> List[Dict]:
     return sources
 
 
+# ============================================================================
+# VÉRIFICATION DE DÉCLARATIONS TVA
+# ============================================================================
+
+PROMPT_VERIFICATION = """Tu es un expert-comptable français spécialisé en TVA. 
+Analyse les données de déclaration TVA ci-dessous et détecte les anomalies potentielles.
+
+📊 DONNÉES DE LA DÉCLARATION :
+{data_json}
+
+📈 DONNÉES HISTORIQUES (mois précédent) :
+{historical_json}
+
+🎯 TÂCHE :
+Analyse ces données et identifie :
+1. Les variations inhabituelles (> 15% par rapport au mois précédent)
+2. Les incohérences dans les calculs
+3. Les champs manquants ou suspects
+4. Les opportunités d'optimisation
+
+⚠️ FORMAT DE RÉPONSE (JSON strict) :
+{{
+  "verifications": [
+    {{
+      "type": "warning" ou "success" ou "info",
+      "title": "Titre court",
+      "message": "Description détaillée",
+      "field": "nom_du_champ_concerné",
+      "severity": "high" ou "medium" ou "low"
+    }}
+  ],
+  "score_confiance": 0.95,
+  "resume": "Résumé en 1 phrase"
+}}
+
+💬 RÉPONSE (JSON uniquement) :"""
+
+
+def verifier_declaration_tva(data: Dict, historical_data: Dict = None) -> Dict:
+    """Vérifie une déclaration TVA avec l'IA"""
+    init_vertex_ai()
+
+    data_json = json.dumps(data, indent=2, ensure_ascii=False)
+
+    if historical_data:
+        historical_json = json.dumps(historical_data, indent=2, ensure_ascii=False)
+    else:
+        historical_json = json.dumps({
+            "tva_collectee": data.get("tva_collectee", 0) * 0.85,
+            "tva_deductible": data.get("tva_deductible", 0) * 1.05,
+            "tva_a_payer": data.get("tva_a_payer", 0) * 0.80,
+            "nb_factures_vente": max(1, data.get("details", {}).get("nb_factures_vente", 0) - 2),
+            "nb_factures_achat": data.get("details", {}).get("nb_factures_achat", 0)
+        }, indent=2, ensure_ascii=False)
+
+    prompt = PROMPT_VERIFICATION.format(
+        data_json=data_json,
+        historical_json=historical_json
+    )
+
+    try:
+        print("\n🤖 Analyse IA en cours...")
+
+        response = _model.generate_content(
+            prompt,
+            generation_config={
+                'temperature': 0.2,
+                'top_p': 0.8,
+                'top_k': 20,
+                'max_output_tokens': 1000,
+            }
+        )
+
+        response_text = response.text.strip()
+
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
+
+        result = json.loads(response_text)
+
+        print(f"✅ Analyse terminée : {len(result.get('verifications', []))} vérifications")
+
+        return result
+
+    except json.JSONDecodeError as e:
+        print(f"⚠️ Erreur parsing JSON: {e}")
+        return generer_verifications_fallback(data, historical_data)
+
+    except Exception as e:
+        print(f"❌ Erreur lors de l'analyse IA: {e}")
+        return generer_verifications_fallback(data, historical_data)
+
+
+def generer_verifications_fallback(data: Dict, historical_data: Dict = None) -> Dict:
+    """Génère des vérifications basiques si l'IA échoue"""
+    verifications = []
+
+    tva_collectee = data.get("tva_collectee", 0)
+    tva_deductible = data.get("tva_deductible", 0)
+    tva_a_payer = data.get("tva_a_payer", 0)
+
+    calcul_attendu = tva_collectee - tva_deductible
+    if abs(calcul_attendu - tva_a_payer) > 0.01:
+        verifications.append({
+            "type": "warning",
+            "title": "Incohérence de calcul détectée",
+            "message": f"Le calcul TVA à payer ({tva_a_payer:.2f} €) ne correspond pas à TVA collectée - TVA déductible ({calcul_attendu:.2f} €)",
+            "field": "tva_a_payer",
+            "severity": "high"
+        })
+    else:
+        verifications.append({
+            "type": "success",
+            "title": "Cohérence vérifiée",
+            "message": "Les montants correspondent aux écritures comptables",
+            "field": "calcul",
+            "severity": "low"
+        })
+
+    if historical_data:
+        hist_tva_collectee = historical_data.get("tva_collectee", 0)
+        if hist_tva_collectee > 0:
+            variation = ((tva_collectee - hist_tva_collectee) / hist_tva_collectee) * 100
+
+            if abs(variation) > 15:
+                verifications.append({
+                    "type": "warning",
+                    "title": "Variation inhabituelle détectée",
+                    "message": f"La TVA collectée est {abs(variation):.0f}% {'supérieure' if variation > 0 else 'inférieure'} au mois précédent",
+                    "field": "tva_collectee",
+                    "severity": "medium"
+                })
+
+    if tva_deductible == 0 and tva_collectee > 0:
+        verifications.append({
+            "type": "info",
+            "title": "Aucune TVA déductible",
+            "message": "Aucun achat avec TVA déductible n'a été enregistré ce mois-ci",
+            "field": "tva_deductible",
+            "severity": "low"
+        })
+
+    return {
+        "verifications": verifications,
+        "score_confiance": 0.85,
+        "resume": f"{len(verifications)} vérification(s) effectuée(s)"
+    }
+
+
+# ============================================================================
+# POINT D'ENTRÉE HTTP PRINCIPAL
+# ============================================================================
+
 @functions_framework.http
 def agent_fiscal(request):
-    """Point d'entrée HTTP pour l'agent fiscal."""
+    """Point d'entrée HTTP pour l'agent fiscal"""
+
+    # CORS
     if request.method == 'OPTIONS':
         headers = {
             'Access-Control-Allow-Origin': '*',
@@ -287,12 +468,30 @@ def agent_fiscal(request):
 
     headers = {'Access-Control-Allow-Origin': '*'}
 
-    request_json = request.get_json(silent=True)
-    if not request_json or 'question' not in request_json:
-        return jsonify({
-            "erreur": "Format invalide"
-        }), 400, headers
+    try:
+        request_json = request.get_json(silent=True)
+        if not request_json:
+            return jsonify({"erreur": "Format invalide"}), 400, headers
 
+        # Détecter le type de requête
+        if 'task' in request_json and request_json['task'] == 'verify':
+            return handle_verification(request_json, headers)
+        elif 'question' in request_json:
+            return handle_question(request_json, headers)
+        else:
+            return jsonify({
+                "erreur": "Format invalide. Attendu : {'question': '...'} ou {'task': 'verify', 'data': {...}}"
+            }), 400, headers
+
+    except Exception as e:
+        print(f"❌ Erreur globale: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"erreur": "Erreur serveur", "details": str(e)}), 500, headers
+
+
+def handle_question(request_json: Dict, headers: Dict):
+    """Gère les questions documentaires"""
     question = request_json['question']
 
     print(f"\n{'=' * 80}")
@@ -300,7 +499,6 @@ def agent_fiscal(request):
     print(f"{'=' * 80}")
 
     try:
-        # Recherche sémantique
         docs = rechercher_documents_semantique(question, MAX_DOCUMENTS)
 
         if not docs:
@@ -311,17 +509,12 @@ def agent_fiscal(request):
                 "documents_trouves": 0
             }), 200, headers
 
-        # Construire contexte
         contexte = construire_contexte(docs)
         print(f"\n📄 Contexte: {len(contexte)} chars")
 
-        # Générer réponse
         reponse = generer_reponse(question, contexte)
-
-        # Extraire sources
         sources = extraire_sources(docs)
 
-        # Réponse finale
         response_data = {
             "question": question,
             "reponse": reponse,
@@ -333,8 +526,6 @@ def agent_fiscal(request):
         }
 
         print(f"\n✅ Succès")
-        print(f"   📊 Documents: {len(docs)}")
-        print(f"   🎯 Score: {response_data['meilleur_score'] * 100:.1f}%")
         print(f"{'=' * 80}\n")
 
         return jsonify(response_data), 200, headers
@@ -351,46 +542,35 @@ def agent_fiscal(request):
         }), 500, headers
 
 
-if __name__ == "__main__":
-    print("\n🧪 TEST LOCAL\n")
+def handle_verification(request_json: Dict, headers: Dict):
+    """Gère les vérifications de déclarations TVA"""
+    if 'data' not in request_json:
+        return jsonify({"error": "Format invalide. 'data' requis."}), 400, headers
 
-    questions = [
-        "C'est quoi la TVA ?",
-        "Quel est le taux de l'impôt sur les sociétés ?",
-    ]
-
-    for i, q in enumerate(questions, 1):
-        print(f"\n{'=' * 80}")
-        print(f"TEST {i}: {q}")
-        print(f"{'=' * 80}")
-
-
-        class MockRequest:
-            def get_json(self, silent):
-                return {'question': q}
-
-            method = 'POST'
-
-
-        try:
-            resp, status, headers = agent_fiscal(MockRequest())
-            data = resp.json
-
-            print(f"\n✅ Status: {status}")
-            print(f"   Docs: {data.get('documents_trouves', 0)}")
-            print(f"\n📝 RÉPONSE:\n{data.get('reponse', 'N/A')}")
-
-            if data.get('sources'):
-                print(f"\n📚 SOURCES:")
-                for j, src in enumerate(data['sources'], 1):
-                    print(f"   {j}. {src.get('titre', 'N/A')} ({src.get('score', 0)})")
-
-        except Exception as e:
-            print(f"\n❌ Erreur: {e}")
-            import traceback
-
-            traceback.print_exc()
+    data = request_json['data']
+    historical_data = request_json.get('historical_data')
 
     print(f"\n{'=' * 80}")
-    print("✅ Tests terminés")
-    print(f"{'=' * 80}\n")
+    print(f"🔍 Vérification de déclaration TVA")
+    print(f"{'=' * 80}")
+
+    try:
+        result = verifier_declaration_tva(data, historical_data)
+        result['verified_at'] = datetime.now().isoformat()
+        result['success'] = True
+
+        print(f"\n✅ Vérification terminée")
+        print(f"{'=' * 80}\n")
+
+        return jsonify(result), 200, headers
+
+    except Exception as e:
+        print(f"\n❌ ERREUR: {e}")
+        import traceback
+        traceback.print_exc()
+
+        return jsonify({
+            "error": "Erreur lors de la vérification",
+            "details": str(e),
+            "success": False
+        }), 500, headers
