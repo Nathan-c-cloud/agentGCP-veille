@@ -1,0 +1,17 @@
+# Ignorer les fichiers inutiles pour accélérer le déploiement
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+*.so
+.DS_Store
+*.log
+.pytest_cache
+.coverage
+htmlcov/
+
