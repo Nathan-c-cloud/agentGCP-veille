@@ -1,0 +1,10 @@
+# Fichiers à ignorer lors du déploiement
+*.md
+*.bat
+.git/
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+test_*.py
+

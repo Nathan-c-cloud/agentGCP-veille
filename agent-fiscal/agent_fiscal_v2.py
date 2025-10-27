@@ -11,11 +11,23 @@ from flask import jsonify
 from google.cloud import storage
 from vertexai.generative_models import GenerativeModel
 from vertexai.language_models import TextEmbeddingModel
+from google.cloud import firestore
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("PROJECT_ID", "agent-gcp-f6005")
 LOCATION = "us-west1"
 BUCKET_NAME = os.environ.get("BUCKET_NAME", "documents-fiscaux-bucket")
+
+# Initialisation Vertex AI
+vertexai.init(project=PROJECT_ID, location=LOCATION)
+
+# Clients Google Cloud
+storage_client = storage.Client()
+db = firestore.Client(project=PROJECT_ID)
+
+# Modèles IA
+model = GenerativeModel("gemini-2.0-flash")
+embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
 
 # --- Paramètres optimisés ---
 MAX_DOCUMENTS = 3
@@ -297,6 +309,288 @@ def extraire_sources(documents: List[Dict]) -> List[Dict]:
     return sources
 
 
+# ==========================================
+# FONCTIONS VEILLE RÉGLEMENTAIRE
+# ==========================================
+
+def determiner_categorie(document: Dict, domaines_prioritaires: List[str]) -> str:
+    """Détermine la catégorie selon la structure alerts."""
+    titre = document.get('titre_source', '').lower()
+    contenu = document.get('contenu', '')[:800].lower()
+    texte = f"{titre} {contenu}"
+
+    # Mapping catégories
+    if any(mot in texte for mot in ['tva', 'taxe sur la valeur']):
+        return "fiscal"
+    elif any(mot in texte for mot in ['rh', 'salarié', 'charges sociales', 'urssaf']):
+        return "rh"
+    elif any(mot in texte for mot in ['loi', 'obligation', 'réglementation']):
+        return "juridique"
+    elif any(mot in texte for mot in ['aide', 'subvention', 'crédit impôt']):
+        return "aides"
+    else:
+        # Utilise domaines prioritaires
+        for domaine in domaines_prioritaires:
+            if domaine.lower() in texte:
+                return domaine.lower()
+        return "fiscal"
+
+
+def generer_analyse_ia(document: Dict, settings: Dict) -> str:
+    """Génère analyse IA via Gemini."""
+    company_info = settings.get('company_info', {})
+    ai_prefs = settings.get('ai_preferences', {})
+
+    ton = ai_prefs.get('tonCommunication', 'professionnel')
+    niveau = ai_prefs.get('niveauDetail', 'standard')
+
+    prompt = f"""Analyse cette nouvelle réglementation pour l'entreprise.
+
+TON: {ton}
+NIVEAU: {niveau}
+
+ENTREPRISE:
+- Nom: {company_info.get('nom')}
+- Secteur: {company_info.get('secteurActivite')}
+- Régime fiscal: {company_info.get('regimeFiscal')}
+- Régime TVA: {company_info.get('regimeTVA')}
+- Forme: {company_info.get('formeJuridique')}
+- Effectif: {company_info.get('effectif')}
+
+DOCUMENT:
+- Titre: {document.get('titre_source')}
+- Extrait: {document.get('contenu', '')[:600]}
+
+CONSIGNE: En 2-3 phrases courtes, explique :
+1. Ce que change cette réglementation
+2. L'impact concret pour cette entreprise
+3. Les actions à prévoir
+
+RÉPONSE (max 120 mots, {ton}):"""
+
+    try:
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                'temperature': 0.3,
+                'max_output_tokens': 200
+            }
+        )
+        return response.text.strip()
+    except Exception as e:
+        print(f"⚠️ Erreur analyse IA: {e}")
+        return f"Nouvelle réglementation {determiner_categorie(document, [])} détectée. Analyse de l'impact recommandée."
+
+
+def generer_actions(categorie: str, document: Dict) -> List[str]:
+    """Génère actions possibles selon catégorie."""
+    actions_map = {
+        "fiscal": [
+            "Consulter votre expert-comptable",
+            "Vérifier la conformité de vos déclarations",
+            "Mettre à jour votre logiciel de comptabilité"
+        ],
+        "rh": [
+            "Informer le service RH",
+            "Vérifier les contrats de travail",
+            "Mettre à jour les procédures internes"
+        ],
+        "juridique": [
+            "Consulter un avocat spécialisé",
+            "Auditer la conformité juridique",
+            "Mettre à jour les mentions légales"
+        ],
+        "aides": [
+            "Vérifier l'éligibilité de votre entreprise",
+            "Préparer le dossier de demande",
+            "Contacter l'organisme compétent"
+        ]
+    }
+
+    return actions_map.get(categorie, [
+        "Consulter un professionnel",
+        "Analyser l'impact pour votre entreprise",
+        "Suivre l'évolution de la réglementation"
+    ])
+
+
+def generer_tags(categorie: str, document: Dict) -> List[str]:
+    """Génère tags prédéfinis selon la catégorie du document."""
+    # Tags prédéfinis par catégorie
+    tags_map = {
+        "fiscal": ["TVA", "IS", "Fiscal", "Déclaration", "Impôts"],
+        "rh": ["DSN", "RH", "Paie", "Formation", "Social"],
+        "juridique": ["Juridique", "Conformité", "Réglementation", "Obligations", "Droit"],
+        "aides": ["Aides", "Subventions", "Financement", "Crédit d'impôt", "Dispositifs"]
+    }
+
+    # Retourne les tags correspondant à la catégorie
+    return tags_map.get(categorie, ["Fiscal", "Réglementation", "Général"])
+
+
+def analyser_pertinence_entreprise(settings: Dict) -> Dict:
+    """Analyse documents GCS et CRÉE alertes Firestore."""
+    print(f"\n🏢 Analyse pour: {settings['company_info'].get('nom')}")
+
+    company_id = settings.get('companyId')
+    user_id = settings.get('userId')
+
+    if not company_id:
+        raise ValueError("settings.companyId manquant")
+
+    # Construction profil textuel
+    company_info = settings.get('company_info', {})
+    ai_prefs = settings.get('ai_preferences', {})
+
+    profil_texte = f"""
+    Entreprise: {company_info.get('nom')}
+    Secteur: {company_info.get('secteurActivite')}
+    Forme juridique: {company_info.get('formeJuridique')}
+    Régime fiscal: {company_info.get('regimeFiscal')}
+    Régime TVA: {company_info.get('regimeTVA')}
+    Effectif: {company_info.get('effectif')}
+    Domaines prioritaires: {', '.join(ai_prefs.get('domainesPrioritaires', []))}
+    """
+
+    # Chargement documents
+    all_docs = charger_documents_depuis_gcs()
+    if not all_docs:
+        print(" Aucun document disponible")
+        return {"nb_alertes_creees": 0, "alertes": []}
+
+    # Embedding profil
+    profil_embedding = obtenir_embedding(profil_texte)
+    if profil_embedding is None:
+        print(" Impossible de générer embedding profil")
+        return {"nb_alertes_creees": 0, "alertes": []}
+
+    print(f" Analyse de {len(all_docs)} documents...")
+    docs_pertinents = []
+
+    # Analyse chaque document
+    for doc in all_docs:
+        titre = doc.get('titre_source', '')
+        contenu = doc.get('contenu', '')
+
+        # Texte pour comparaison
+        doc_texte = f"{titre}. {titre}. {contenu[:2000]}"
+        doc_embedding = obtenir_embedding(doc_texte)
+
+        if doc_embedding is None:
+            continue
+
+        # Calcul similarité
+        score_base = calculer_similarite_cosinus(profil_embedding, doc_embedding)
+
+        if score_base >= MIN_SIMILARITY_SCORE:
+            # Bonus domaines prioritaires
+            domaines = ai_prefs.get('domainesPrioritaires', [])
+            bonus_domaine = sum(0.10 for d in domaines
+                                if d.lower() in titre.lower() or d.lower() in contenu[:500].lower())
+
+            # Bonus régime spécifique
+            bonus_regime = 0
+            regime_fiscal = company_info.get('regimeFiscal', '').lower()
+            regime_tva = company_info.get('regimeTVA', '').lower()
+            texte_complet = f"{titre} {contenu[:1000]}".lower()
+
+            if regime_fiscal and regime_fiscal.replace('_', ' ') in texte_complet:
+                bonus_regime += 0.15
+            if regime_tva and regime_tva.replace('_', ' ') in texte_complet:
+                bonus_regime += 0.15
+
+            score_final = min(score_base + bonus_domaine + bonus_regime, 1.0)
+
+            doc['score'] = score_final
+            doc['score_base'] = score_base
+            docs_pertinents.append(doc)
+
+    # Tri par pertinence
+    docs_pertinents.sort(key=lambda x: x['score'], reverse=True)
+    docs_pertinents = docs_pertinents[:MAX_DOCUMENTS]
+
+    print(f" {len(docs_pertinents)} documents pertinents trouvés")
+
+    # CRÉATION ALERTES FIRESTORE
+    alertes_creees = []
+    date_maintenant = datetime.now()
+
+    for doc in docs_pertinents:
+        # Détermination type urgence
+        score = doc['score']
+        if score > 0.75:
+            type_urgence = "urgent"
+            priorite = 1
+        elif score > 0.55:
+            type_urgence = "info"
+            priorite = 2
+        else:
+            type_urgence = "normal"
+            priorite = 3
+
+        # Catégorisation
+        categorie = determiner_categorie(doc, ai_prefs.get('domainesPrioritaires', []))
+
+        # Génération analyse IA
+        ai_analysis = generer_analyse_ia(doc, settings)
+
+        # Génération des tags selon la catégorie
+        tags = generer_tags(categorie, doc)
+
+        # Construction alerte selon structure EXACTE
+        alerte_data = {
+            "companyId": company_id,
+            "userId": user_id,
+            "title": doc.get('titre_source', 'Nouvelle réglementation'),
+            "summary": doc.get('contenu', '')[:200] + "...",
+            "type": type_urgence,
+            "category": categorie,
+            "aiAnalysis": ai_analysis,
+            "sourceUrl": doc.get('source_url', ''),
+            "detectedDate": date_maintenant.isoformat(),
+            "processedDate": None,
+            "status": "nouveau",
+            "priority": priorite,
+            "actions": generer_actions(categorie, doc),
+            "timeline": [
+                {
+                    "date": date_maintenant.isoformat(),
+                    "event": "Détection automatique",
+                    "actor": "Agent Fiscal IA"
+                }
+            ],
+            "pertinence": {
+                "score": round(score, 3),
+                "score_base": round(doc['score_base'], 3),
+                "raisons": [
+                    f"Correspondance avec régime {company_info.get('regimeFiscal')}",
+                    f"Pertinent pour secteur {company_info.get('secteurActivite')}"
+                ]
+            },
+            "tags": tags
+        }
+
+        # Écriture Firestore
+        try:
+            alerte_ref = db.collection('info_alerts').add(alerte_data)
+            alerte_id = alerte_ref[1].id
+            alerte_data['id'] = alerte_id
+            alertes_creees.append(alerte_data)
+            print(f"  Alerte créée: {alerte_id} [{type_urgence}] {doc.get('titre_source', '')[:50]}")
+        except Exception as e:
+            print(f"   Erreur création alerte: {e}")
+
+    return {
+        "nb_alertes_creees": len(alertes_creees),
+        "alertes": alertes_creees,
+        "date_analyse": date_maintenant.isoformat(),
+        "company_id": company_id
+    }
+
+
+@functions_framework.http
+def agent_fiscal(request):
+    """Point d'entrée HTTP pour l'agent fiscal - Support 2 modes."""
 # ============================================================================
 # VÉRIFICATION DE DÉCLARATIONS TVA
 # ============================================================================
@@ -579,21 +873,33 @@ def handle_question(request_json: Dict, headers: Dict):
     """Gère les questions documentaires"""
     question = request_json['question']
 
-    print(f"\n{'=' * 80}")
-    print(f"📥 Question: {question}")
-    print(f"{'=' * 80}")
+    # MODE 1: Analyse entreprise → Création alertes Firestore
+    if 'settings' in request_json:
+        print("\n🏢 MODE: Analyse Entreprise → Firestore alerts")
+        settings = request_json['settings']
 
+        try:
+            resultat = analyser_pertinence_entreprise(settings)
     try:
         docs = rechercher_documents_semantique(question, MAX_DOCUMENTS)
 
-        if not docs:
             return jsonify({
-                "question": question,
-                "reponse": "## Aucun document\n\nDésolé, aucune information pertinente trouvée.",
-                "sources": [],
-                "documents_trouves": 0
+                "succes": True,
+                "companyId": resultat['company_id'],
+                "companyName": settings['company_info'].get('nom'),
+                "nbAlertesCreees": resultat['nb_alertes_creees'],
+                "dateAnalyse": resultat['date_analyse']
             }), 200, headers
 
+        except Exception as e:
+            print(f" Erreur analyse: {e}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({"erreur": str(e)}), 500, headers
+
+    # MODE 2: Question classique (existant)
+    elif 'question' in request_json:
+        question = request_json['question']
         contexte = construire_contexte(docs)
         print(f"\n📄 Contexte: {len(contexte)} chars")
 
@@ -613,18 +919,65 @@ def handle_question(request_json: Dict, headers: Dict):
         print(f"\n✅ Succès")
         print(f"{'=' * 80}\n")
 
-        return jsonify(response_data), 200, headers
+        print(f"\n{'=' * 80}")
+        print(f" Question: {question}")
+        print(f"{'=' * 80}")
 
-    except Exception as e:
-        print(f"\n❌ ERREUR: {e}")
-        import traceback
-        traceback.print_exc()
+        try:
+            # Recherche sémantique
+            docs = rechercher_documents_semantique(question, MAX_DOCUMENTS)
 
+            if not docs:
+                return jsonify({
+                    "question": question,
+                    "reponse": "## Aucun document\n\nDésolé, aucune information pertinente trouvée.",
+                    "sources": [],
+                    "documents_trouves": 0
+                }), 200, headers
+
+            # Construire contexte
+            contexte = construire_contexte(docs)
+            print(f"\n Contexte: {len(contexte)} chars")
+
+            # Générer réponse
+            reponse = generer_reponse(question, contexte)
+
+            # Extraire sources
+            sources = extraire_sources(docs)
+
+            # Réponse finale
+            response_data = {
+                "question": question,
+                "reponse": reponse,
+                "sources": sources,
+                "documents_trouves": len(docs),
+                "methode_recherche": "semantique",
+                "score_moyen": round(sum(d['score'] for d in docs) / len(docs), 2),
+                "meilleur_score": round(docs[0]['score'], 2)
+            }
+
+            print(f"\n Succès")
+            print(f"  Documents: {len(docs)}")
+            print(f"  Score: {response_data['meilleur_score'] * 100:.1f}%")
+            print(f"{'=' * 80}\n")
+
+            return jsonify(response_data), 200, headers
+
+        except Exception as e:
+            print(f"\n ERREUR: {e}")
+            import traceback
+            traceback.print_exc()
+
+            return jsonify({
+                "erreur": "Erreur serveur",
+                "details": str(e),
+                "question": question
+            }), 500, headers
+
+    else:
         return jsonify({
-            "erreur": "Erreur serveur",
-            "details": str(e),
-            "question": question
-        }), 500, headers
+            "erreur": "Manque 'settings' (analyse) ou 'question' (chat)"
+        }), 400, headers
 
 
 def handle_verification(request_json: Dict, headers: Dict):

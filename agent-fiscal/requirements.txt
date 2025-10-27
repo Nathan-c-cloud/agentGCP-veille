@@ -1,5 +1,15 @@
 functions-framework==3.*
-google-cloud-aiplatform==1.*
+
+# Google Cloud
 google-cloud-storage==2.*
-numpy==1.24.3
-Flask==3.*
+google-cloud-firestore==2.*
+google-cloud-aiplatform==1.*
+
+# Flask (utilisé par functions-framework)
+flask==3.*
+
+# HTTP requests pour communication entre fonctions
+requests==2.31.*
+
+# Numpy pour calculs d'embeddings et similarité cosinus
+numpy==1.24.*
