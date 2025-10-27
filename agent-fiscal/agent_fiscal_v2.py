@@ -830,10 +830,20 @@ def agent_fiscal(request):
         elif 'settings' in request_json and isinstance(request_json['settings'], dict):
             settings = request_json['settings']
 
-            # PRIORITÉ : Si contient des données TVA → Vérification
-            if any(key in settings for key in ['tva_collectee', 'tva_deductible', 'tva_a_payer',
+            # PRIORITÉ 1 : Si settings.task = "verify" → Vérification TVA
+            if settings.get('task') == 'verify' and 'data' in settings:
+                print("✅ Format détecté: settings avec task=verify (vérification TVA)")
+                reformatted_request = {
+                    'task': 'verify',
+                    'data': settings['data'],
+                    'historical_data': settings.get('historical_data')
+                }
+                return handle_verification(reformatted_request, headers)
+
+            # PRIORITÉ 2 : Si contient des données TVA au premier niveau dans settings
+            elif any(key in settings for key in ['tva_collectee', 'tva_deductible', 'tva_a_payer',
                                                'tvaCollectee', 'tvaDeductible', 'tvaAPayer']):
-                print("✅ Format détecté: settings avec TVA (vérification)")
+                print("✅ Format détecté: settings avec TVA directe (vérification)")
                 reformatted_request = {
                     'task': 'verify',
                     'data': settings,
@@ -841,9 +851,9 @@ def agent_fiscal(request):
                 }
                 return handle_verification(reformatted_request, headers)
 
-            # SINON : Si contient company_info → Veille
-            elif 'company_info' in settings:
-                print("✅ Format détecté: settings avec company_info (veille)")
+            # PRIORITÉ 3 : Si contient company_info SANS task=verify → Veille
+            elif 'company_info' in settings and settings.get('task') != 'verify':
+                print("✅ Format détecté: settings avec company_info (veille réglementaire)")
                 try:
                     resultat = analyser_pertinence_entreprise(settings)
                     return jsonify({
