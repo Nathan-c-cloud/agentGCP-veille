@@ -46,6 +46,7 @@ _model = None
 _embedding_model = None
 _storage_client = None
 
+
 # ⚠️ PAS D'INITIALISATION AU DÉMARRAGE - Tout est fait en lazy loading
 
 
@@ -588,9 +589,6 @@ def analyser_pertinence_entreprise(settings: Dict) -> Dict:
     }
 
 
-@functions_framework.http
-def agent_fiscal(request):
-    """Point d'entrée HTTP pour l'agent fiscal - Support 2 modes."""
 # ============================================================================
 # VÉRIFICATION DE DÉCLARATIONS TVA
 # ============================================================================
@@ -774,34 +772,17 @@ def agent_fiscal(request):
         print(f"{'=' * 80}\n")
 
         # Détecter le type de requête de manière TRÈS flexible
+        # PRIORITÉ 1 : Vérifications TVA (avant settings pour éviter confusion avec veille)
 
         # Format 1: {"task": "verify", "data": {...}}
         if 'task' in request_json and request_json['task'] == 'verify':
             print("✅ Format détecté: task + data")
             return handle_verification(request_json, headers)
 
-        # Format 2: {"question": "..."}
-        elif 'question' in request_json:
-            print("✅ Format détecté: question")
-            return handle_question(request_json, headers)
-
-        # Format 3: {"settings": {...}} - Format du frontend !
-        elif 'settings' in request_json and isinstance(request_json['settings'], dict):
-            print("✅ Format détecté: settings wrapper (frontend)")
-            settings = request_json['settings']
-
-            # Extraire les données de la déclaration depuis settings
-            reformatted_request = {
-                'task': 'verify',
-                'data': settings,
-                'historical_data': request_json.get('historical_data') or settings.get('historical_data')
-            }
-            return handle_verification(reformatted_request, headers)
-
-        # Format 4: Direct TVA data - vérifier plusieurs variantes
+        # Format 2: Direct TVA data au premier niveau
         elif any(key in request_json for key in ['tva_collectee', 'tva_deductible', 'tva_a_payer',
-                                                   'tvaCollectee', 'tvaDeductible', 'tvaAPayer']):
-            print("✅ Format détecté: données TVA directes")
+                                                 'tvaCollectee', 'tvaDeductible', 'tvaAPayer']):
+            print("✅ Format détecté: données TVA directes au premier niveau")
             # Normaliser les clés (camelCase -> snake_case)
             normalized_data = {}
             for key, value in request_json.items():
@@ -823,7 +804,7 @@ def agent_fiscal(request):
             }
             return handle_verification(reformatted_request, headers)
 
-        # Format 5: Données imbriquées dans "declaration"
+        # Format 3: {"declaration": {...}}
         elif 'declaration' in request_json:
             print("✅ Format détecté: declaration wrapper")
             reformatted_request = {
@@ -833,12 +814,11 @@ def agent_fiscal(request):
             }
             return handle_verification(reformatted_request, headers)
 
-        # Format 6: Données imbriquées dans "data"
+        # Format 4: {"data": {...}} avec données TVA
         elif 'data' in request_json and isinstance(request_json['data'], dict):
-            # Si 'data' est présent mais pas 'task', on suppose que c'est une vérification
             if any(key in request_json['data'] for key in ['tva_collectee', 'tva_deductible', 'tva_a_payer',
-                                                             'tvaCollectee', 'tvaDeductible', 'tvaAPayer']):
-                print("✅ Format détecté: data wrapper sans task")
+                                                           'tvaCollectee', 'tvaDeductible', 'tvaAPayer']):
+                print("✅ Format détecté: data wrapper avec TVA")
                 reformatted_request = {
                     'task': 'verify',
                     'data': request_json['data'],
@@ -846,6 +826,48 @@ def agent_fiscal(request):
                 }
                 return handle_verification(reformatted_request, headers)
 
+        # Format 5: {"settings": {...}} - VÉRIFIER SI TVA OU VEILLE
+        elif 'settings' in request_json and isinstance(request_json['settings'], dict):
+            settings = request_json['settings']
+
+            # PRIORITÉ : Si contient des données TVA → Vérification
+            if any(key in settings for key in ['tva_collectee', 'tva_deductible', 'tva_a_payer',
+                                               'tvaCollectee', 'tvaDeductible', 'tvaAPayer']):
+                print("✅ Format détecté: settings avec TVA (vérification)")
+                reformatted_request = {
+                    'task': 'verify',
+                    'data': settings,
+                    'historical_data': request_json.get('historical_data') or settings.get('historical_data')
+                }
+                return handle_verification(reformatted_request, headers)
+
+            # SINON : Si contient company_info → Veille
+            elif 'company_info' in settings:
+                print("✅ Format détecté: settings avec company_info (veille)")
+                try:
+                    resultat = analyser_pertinence_entreprise(settings)
+                    return jsonify({
+                        "succes": True,
+                        "companyId": resultat['company_id'],
+                        "companyName": settings['company_info'].get('nom'),
+                        "nbAlertesCreees": resultat['nb_alertes_creees'],
+                        "dateAnalyse": resultat['date_analyse']
+                    }), 200, headers
+                except Exception as e:
+                    print(f"❌ Erreur analyse veille: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return jsonify({"erreur": str(e)}), 500, headers
+
+        # Format 6: {"question": "..."} - Questions documentaires
+        elif 'question' in request_json:
+            print("✅ Format détecté: question documentaire")
+            return handle_question(request_json, headers)
+
+        # Format 7: Données imbriquées dans "data"
+        # (déjà géré dans format 4, mais au cas où)
+
+        # Format non reconnu
         else:
             print("❌ Format non reconnu")
             print(f"Clés présentes: {list(request_json.keys())}")
@@ -873,39 +895,33 @@ def handle_question(request_json: Dict, headers: Dict):
     """Gère les questions documentaires"""
     question = request_json['question']
 
-    # MODE 1: Analyse entreprise → Création alertes Firestore
-    if 'settings' in request_json:
-        print("\n🏢 MODE: Analyse Entreprise → Firestore alerts")
-        settings = request_json['settings']
+    print(f"\n{'=' * 80}")
+    print(f"📥 Question: {question}")
+    print(f"{'=' * 80}")
 
-        try:
-            resultat = analyser_pertinence_entreprise(settings)
     try:
+        # Recherche sémantique
         docs = rechercher_documents_semantique(question, MAX_DOCUMENTS)
 
+        if not docs:
             return jsonify({
-                "succes": True,
-                "companyId": resultat['company_id'],
-                "companyName": settings['company_info'].get('nom'),
-                "nbAlertesCreees": resultat['nb_alertes_creees'],
-                "dateAnalyse": resultat['date_analyse']
+                "question": question,
+                "reponse": "## Aucun document\n\nDésolé, aucune information pertinente trouvée.",
+                "sources": [],
+                "documents_trouves": 0
             }), 200, headers
 
-        except Exception as e:
-            print(f" Erreur analyse: {e}")
-            import traceback
-            traceback.print_exc()
-            return jsonify({"erreur": str(e)}), 500, headers
-
-    # MODE 2: Question classique (existant)
-    elif 'question' in request_json:
-        question = request_json['question']
+        # Construire contexte
         contexte = construire_contexte(docs)
         print(f"\n📄 Contexte: {len(contexte)} chars")
 
+        # Générer réponse
         reponse = generer_reponse(question, contexte)
+
+        # Extraire sources
         sources = extraire_sources(docs)
 
+        # Réponse finale
         response_data = {
             "question": question,
             "reponse": reponse,
@@ -917,67 +933,22 @@ def handle_question(request_json: Dict, headers: Dict):
         }
 
         print(f"\n✅ Succès")
+        print(f"   📊 Documents: {len(docs)}")
+        print(f"   🎯 Score: {response_data['meilleur_score'] * 100:.1f}%")
         print(f"{'=' * 80}\n")
 
-        print(f"\n{'=' * 80}")
-        print(f" Question: {question}")
-        print(f"{'=' * 80}")
+        return jsonify(response_data), 200, headers
 
-        try:
-            # Recherche sémantique
-            docs = rechercher_documents_semantique(question, MAX_DOCUMENTS)
+    except Exception as e:
+        print(f"\n❌ ERREUR: {e}")
+        import traceback
+        traceback.print_exc()
 
-            if not docs:
-                return jsonify({
-                    "question": question,
-                    "reponse": "## Aucun document\n\nDésolé, aucune information pertinente trouvée.",
-                    "sources": [],
-                    "documents_trouves": 0
-                }), 200, headers
-
-            # Construire contexte
-            contexte = construire_contexte(docs)
-            print(f"\n Contexte: {len(contexte)} chars")
-
-            # Générer réponse
-            reponse = generer_reponse(question, contexte)
-
-            # Extraire sources
-            sources = extraire_sources(docs)
-
-            # Réponse finale
-            response_data = {
-                "question": question,
-                "reponse": reponse,
-                "sources": sources,
-                "documents_trouves": len(docs),
-                "methode_recherche": "semantique",
-                "score_moyen": round(sum(d['score'] for d in docs) / len(docs), 2),
-                "meilleur_score": round(docs[0]['score'], 2)
-            }
-
-            print(f"\n Succès")
-            print(f"  Documents: {len(docs)}")
-            print(f"  Score: {response_data['meilleur_score'] * 100:.1f}%")
-            print(f"{'=' * 80}\n")
-
-            return jsonify(response_data), 200, headers
-
-        except Exception as e:
-            print(f"\n ERREUR: {e}")
-            import traceback
-            traceback.print_exc()
-
-            return jsonify({
-                "erreur": "Erreur serveur",
-                "details": str(e),
-                "question": question
-            }), 500, headers
-
-    else:
         return jsonify({
-            "erreur": "Manque 'settings' (analyse) ou 'question' (chat)"
-        }), 400, headers
+            "erreur": "Erreur serveur",
+            "details": str(e),
+            "question": question
+        }), 500, headers
 
 
 def handle_verification(request_json: Dict, headers: Dict):
