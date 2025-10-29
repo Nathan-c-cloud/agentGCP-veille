@@ -41,12 +41,12 @@ AGENTS_CONFIG = {
         "requires_auth": False  # Cloud Function publique
     },
     "comptabilite": {
-        "url": None,
+        "url": "https://agent-accounting-planner-478570587937.us-west1.run.app",
         "description": "Questions sur la comptabilité, bilans, comptes",
         "requires_auth": False
     },
     "ressources_humaines": {
-        "url": None,
+        "url": "https://agent-social-planner-478570587937.us-west1.run.app",
         "description": "Questions sur les RH, contrats, paie, social",
         "requires_auth": False
     },
