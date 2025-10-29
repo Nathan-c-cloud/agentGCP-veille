@@ -58,9 +58,72 @@ AGENTS_CONFIG = {
     "aides": {
         "url": "https://agent-aides-478570587937.us-west1.run.app",
         "description": "Questions sur les aides publiques et subventions",
-        "requires_auth": True  # Cloud Run avec authentification
+        "requires_auth": True,  # Cloud Run avec authentification
+        "needs_company_info": True  # Nécessite les infos de l'entreprise
     }
 }
+
+
+def recuperer_infos_entreprise() -> Dict:
+    """
+    Récupère les informations de l'entreprise depuis Firestore.
+    Collection: settings, Document: demo_company
+
+    Returns:
+        Dict contenant les informations de l'entreprise
+    """
+    print(f"\n📊 Récupération des informations de l'entreprise...")
+
+    try:
+        doc_ref = db.collection('settings').document('demo_company')
+        doc = doc_ref.get()
+
+        if doc.exists:
+            data = doc.to_dict()
+            print(f"   ✅ Document récupéré avec succès")
+
+            # Le document peut avoir deux structures possibles:
+            # 1. Champs directement à la racine (nom, ville, codePostal, etc.)
+            # 2. Champs imbriqués dans company_info
+
+            # Vérifier si company_info existe (structure imbriquée)
+            if 'company_info' in data and isinstance(data['company_info'], dict):
+                company_data = data['company_info']
+                print(f"   📋 Structure imbriquée détectée (company_info)")
+            else:
+                company_data = data
+                print(f"   📋 Structure plate détectée")
+
+            # Extraire les informations pertinentes pour les aides
+            infos_pour_aides = {
+                "nom": company_data.get('nom', 'Non spécifié'),
+                "localisation": {
+                    "ville": company_data.get('ville', 'Non spécifié'),
+                    "code_postal": company_data.get('codePostal', 'Non spécifié'),
+                    "adresse": company_data.get('adresse', 'Non spécifié')
+                },
+                "taille": company_data.get('effectif', 'Non spécifié'),
+                "secteur_activite": company_data.get('secteurActivite', 'Non spécifié'),
+                "forme_juridique": company_data.get('formeJuridique', 'Non spécifié'),
+                "date_creation": company_data.get('dateCreation', 'Non spécifié'),
+                "siret": company_data.get('siret', 'Non spécifié')
+            }
+
+            print(f"   📍 Localisation: {infos_pour_aides['localisation']['ville']} ({infos_pour_aides['localisation']['code_postal']})")
+            print(f"   👥 Effectif: {infos_pour_aides['taille']}")
+            print(f"   🏭 Secteur: {infos_pour_aides['secteur_activite']}")
+
+            return infos_pour_aides
+        else:
+            print(f"   ⚠️ Document demo_company non trouvé dans la collection settings")
+            return {}
+
+    except Exception as e:
+        print(f"   ❌ Erreur lors de la récupération des infos entreprise: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
+
 
 # --- Prompt de classification ---
 PROMPT_CLASSIFICATION = """Tu es un classificateur de questions pour un système multi-agents.
@@ -134,19 +197,27 @@ def appeler_agent_specialise(agent_name: str, question: str) -> Dict:
     try:
         base_url = agent_config["url"]
         requires_auth = agent_config.get("requires_auth", False)
+        needs_company_info = agent_config.get("needs_company_info", False)
 
         # Préparer l'URL et le payload selon le type d'agent
         if agent_name in ["juridique", "aides"]:
             # Agents Flask sur Cloud Run
             url = f"{base_url}/query" if not base_url.endswith("/query") else base_url
             payload = {"user_query": question}
+
+            # Si l'agent nécessite les infos de l'entreprise, les ajouter
+            if needs_company_info and agent_name == "aides":
+                company_info = recuperer_infos_entreprise()
+                if company_info:
+                    payload["company_info"] = company_info
+                    print(f"   📊 Infos entreprise ajoutées au payload")
         else:
             # Agent fiscal (Cloud Function)
             url = base_url
             payload = {"question": question}
 
         print(f"   🌐 URL: {url}")
-        print(f"   📦 Payload: {payload}")
+        print(f"   📦 Payload: {list(payload.keys())}")
         print(f"   🔒 Authentification requise: {requires_auth}")
 
         # Faire la requête avec ou sans authentification
@@ -175,13 +246,23 @@ def appeler_agent_specialise(agent_name: str, question: str) -> Dict:
                 # Traiter la réponse selon le type d'agent
                 if agent_name in ["juridique", "aides"]:
                     if isinstance(data, dict):
+                        # Nettoyer les données: supprimer les champs handoff si non nécessaires
+                        cleaned_data = data.copy()
+
+                        # Supprimer les informations de handoff si handoff.needed = false
+                        if isinstance(cleaned_data.get("handoff"), dict):
+                            handoff = cleaned_data.get("handoff", {})
+                            if not handoff.get("needed", False):
+                                # Supprimer complètement la section handoff si elle n'est pas nécessaire
+                                cleaned_data.pop("handoff", None)
+
                         # Extraire les informations pertinentes
-                        reponse_text = data.get("checklist", "") or data.get("aides_identifiees", "") or str(data)
-                        sources = data.get("sources", [])
+                        sources = cleaned_data.get("sources", []) or cleaned_data.get("sources_officielles", [])
+
                         return {
-                            "reponse": json.dumps(data, indent=2, ensure_ascii=False),
+                            "reponse": json.dumps(cleaned_data, indent=2, ensure_ascii=False),
                             "sources": sources,
-                            "data_complete": data
+                            "data_complete": cleaned_data
                         }
                     else:
                         return {"reponse": str(data), "sources": []}
@@ -339,4 +420,3 @@ if __name__ == "__main__":
             print(f"   💬 {reponse['reponse'][:200]}...")
         if "sources" in reponse:
             print(f"   📚 Sources: {len(reponse['sources'])} document(s)")
-

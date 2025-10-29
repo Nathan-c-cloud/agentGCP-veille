@@ -14,14 +14,22 @@ LOCATION = os.environ.get("LOCATION", "us-west1")
 SI_TEXT_AIDES = """Tu es un Agent_Aides. Ta mission : identifier et résumer les aides publiques pertinentes pour une entreprise française (nationales, régionales, européennes), et fournir une sortie JSON strictement conforme au schéma.
 
 **Instructions strictes :**
-1. Analysez la question de l'utilisateur.
-2. Fondez votre réponse **uniquement** sur les informations présentes dans le contexte récupéré.
-3. Si le contexte ne contient pas la réponse, indiquez "Je ne trouve pas d'aides correspondantes dans ma base de connaissances."
-4. Ne jamais utiliser vos connaissances générales, utiliser l'ancrage pour fiabilisé votre réponse.
-5. Citez vos sources en vous basant sur le contexte.
-6. Répondez au format JSON structuré.
+1. Analysez la question de l'utilisateur ET le contexte de l'entreprise fourni (localisation, taille, secteur d'activité).
+2. Fondez votre réponse **uniquement** sur les informations présentes dans le contexte récupéré via RAG.
+3. **IMPORTANT**: Si un contexte d'entreprise est fourni (ville, département, taille, secteur), utilisez-le pour filtrer et cibler les aides les PLUS PERTINENTES pour ce profil spécifique.
+4. Mentionnez explicitement dans votre réponse comment le profil de l'entreprise correspond aux critères des aides identifiées.
+5. Si le contexte ne contient pas d'aides correspondant au profil spécifique, indiquez "Je ne trouve pas d'aides correspondantes pour [profil] dans ma base de connaissances."
+6. Ne jamais utiliser vos connaissances générales, utilisez l'ancrage pour fiabiliser votre réponse.
+7. Citez vos sources en vous basant sur le contexte.
+8. Répondez au format JSON structuré.
 
-Tu FOURNIS : (1) une liste des AIDES IDENTIFIÉES, (2) les CRITÈRES D'ÉLIGIBILITÉ,
+**Profil de recherche:**
+- Localisation (région/département) → Aides régionales et départementales ciblées
+- Taille (TPE/PME/ETI) → Aides adaptées à la taille
+- Secteur d'activité → Aides sectorielles spécifiques
+- Nature du projet → Aides thématiques (innovation, export, transition écologique, etc.)
+
+Tu FOURNIS : (1) une liste des AIDES IDENTIFIÉES adaptées au profil, (2) les CRITÈRES D'ÉLIGIBILITÉ avec mention du profil,
 (3) les MONTANTS et MODALITÉS, (4) les SOURCES OFFICIELLES (titre + URL), (5) un DISCLAIMER final
 
 Contraintes :
@@ -49,26 +57,40 @@ generate_content_config = types.GenerateContentConfig(
     tools=[
         types.Tool(
             retrieval=types.Retrieval(
-                vertex_ai_search=types.VertexAISearch(datastore=DATASTORE_AIDES)
+                vertex_ai_search=types.VertexAISearch(
+                    datastore=DATASTORE_AIDES
+                )
             )
         )
     ],
-    system_instruction=[types.Part.from_text(text=SI_TEXT_AIDES)],
-    thinking_config=types.ThinkingConfig(thinking_budget=-1),
+    system_instruction=types.Content(
+        role="user",
+        parts=[types.Part.from_text(text=SI_TEXT_AIDES)]
+    )
 )
 
 
 @app.route("/query", methods=["POST"])
-def handle_query():
+def query():
     """
-    Endpoint API pour traiter les requêtes sur les aides.
+    Endpoint pour traiter les requêtes utilisateur.
     """
     data = request.get_json()
-    if "user_query" not in data:
+    if not data or "user_query" not in data:
         return jsonify({"error": "Missing 'user_query' in JSON payload"}), 400
 
     user_query = data["user_query"]
+    company_info = data.get("company_info", {})
+
     print(f"Agent Aides: Requête reçue: {user_query}")
+
+    # Si des infos entreprise sont fournies, les afficher
+    if company_info:
+        print(f"Agent Aides: Informations entreprise reçues:")
+        print(f"  - Nom: {company_info.get('nom', 'N/A')}")
+        print(f"  - Localisation: {company_info.get('localisation', {}).get('ville', 'N/A')}")
+        print(f"  - Taille: {company_info.get('taille', 'N/A')}")
+        print(f"  - Secteur: {company_info.get('secteur_activite', 'N/A')}")
 
     # Créer le client à l'intérieur de la fonction (évite les problèmes de lifecycle)
     try:
@@ -89,11 +111,33 @@ def handle_query():
             "details": str(e)
         }), 500
 
+    # Enrichir la requête utilisateur avec les infos de l'entreprise
+    enriched_query = user_query
+    if company_info:
+        context_entreprise = f"""
+CONTEXTE DE L'ENTREPRISE :
+- Nom: {company_info.get('nom', 'Non spécifié')}
+- Localisation: {company_info.get('localisation', {}).get('ville', 'Non spécifié')} ({company_info.get('localisation', {}).get('code_postal', 'N/A')})
+- Région/Département: Déterminé par le code postal
+- Taille de l'entreprise: {company_info.get('taille', 'Non spécifié')}
+- Secteur d'activité: {company_info.get('secteur_activite', 'Non spécifié')}
+- Forme juridique: {company_info.get('forme_juridique', 'Non spécifié')}
+- Date de création: {company_info.get('date_creation', 'Non spécifié')}
+
+QUESTION DE L'UTILISATEUR :
+{user_query}
+
+INSTRUCTIONS :
+Utilisez ces informations pour identifier les aides publiques les plus pertinentes pour cette entreprise.
+Considérez la localisation (région, département), la taille (TPE/PME/ETI), le secteur d'activité et la nature du projet mentionné dans la question.
+"""
+        enriched_query = context_entreprise
+
     # Préparer le contenu de la requête
     contents = [
         types.Content(
             role="user",
-            parts=[types.Part.from_text(text=user_query)]
+            parts=[types.Part.from_text(text=enriched_query)]
         ),
     ]
 
@@ -169,4 +213,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(debug=True, host="0.0.0.0", port=port)
-
