@@ -238,7 +238,7 @@ def appeler_agent_specialise(agent_name: str, question: str) -> Dict:
         needs_company_info = agent_config.get("needs_company_info", False)
 
         # Préparer l'URL et le payload selon le type d'agent
-        if agent_name in ["juridique", "aides"]:
+        if agent_name in ["juridique", "aides", "comptabilite", "ressources_humaines"]:
             # Agents Flask sur Cloud Run
             url = f"{base_url}/query" if not base_url.endswith("/query") else base_url
             payload = {"user_query": question}
@@ -281,55 +281,55 @@ def appeler_agent_specialise(agent_name: str, question: str) -> Dict:
             try:
                 data = response.json()
 
-                # Traiter la réponse selon le type d'agent
-                if agent_name in ["juridique", "aides"]:
-                    if isinstance(data, dict):
-                        # Nettoyer les données: supprimer les champs handoff si non nécessaires
-                        cleaned_data = data.copy()
+                # Nettoyer TOUTES les réponses (tous les agents)
+                if isinstance(data, dict):
+                    cleaned_data = data.copy()
 
-                        # Supprimer COMPLÈTEMENT les informations de handoff si handoff.needed = false ou non défini
-                        if "handoff" in cleaned_data:
-                            handoff = cleaned_data.get("handoff", {})
-                            # Supprimer le handoff s'il n'est pas nécessaire
-                            if not handoff.get("needed", False):
-                                del cleaned_data["handoff"]
-                                print(f"   🧹 Section handoff supprimée (non nécessaire)")
-                            else:
-                                print(f"   ⚠️ Handoff nécessaire conservé : {handoff}")
-
-                        # Double vérification : s'assurer qu'il n'y a pas de handoff avec needed=false
-                        if "handoff" in cleaned_data and not cleaned_data["handoff"].get("needed", False):
+                    # Supprimer les informations de handoff si présentes et non nécessaires
+                    if "handoff" in cleaned_data:
+                        handoff = cleaned_data.get("handoff", {})
+                        if not handoff.get("needed", False):
                             del cleaned_data["handoff"]
-                            print(f"   🧹 Double suppression du handoff (sécurité)")
-
-                        # Extraire les informations pertinentes
-                        sources = cleaned_data.get("sources", []) or cleaned_data.get("sources_officielles", [])
-
-                        # Créer le JSON sans le handoff inutile
-                        json_response = json.dumps(cleaned_data, indent=2, ensure_ascii=False)
-
-                        # Vérification finale : le mot "handoff" ne doit pas apparaître dans la réponse
-                        # (sauf si vraiment nécessaire)
-                        if '"handoff"' in json_response.lower():
-                            print(f"   ⚠️ ATTENTION: Le mot 'handoff' est toujours présent dans la réponse JSON")
+                            print(f"   🧹 Section handoff supprimée (non nécessaire)")
                         else:
-                            print(f"   ✅ Réponse nettoyée : aucune trace de 'handoff'")
+                            print(f"   ⚠️ Handoff nécessaire conservé : {handoff}")
 
-                        return {
-                            "reponse": json_response,
-                            "sources": sources,
-                            "data_complete": cleaned_data  # cleaned_data n'a plus de handoff
-                        }
+                    # Double vérification pour le handoff
+                    if "handoff" in cleaned_data and not cleaned_data["handoff"].get("needed", False):
+                        del cleaned_data["handoff"]
+                        print(f"   🧹 Double suppression du handoff (sécurité)")
+
+                    # Nettoyer les balises markdown dans les champs texte
+                    for key in ["reponse", "message"]:
+                        if key in cleaned_data and isinstance(cleaned_data[key], str):
+                            text = cleaned_data[key].strip()
+                            # Supprimer les balises markdown ```json ... ```
+                            if text.startswith("```json"):
+                                text = text[7:]
+                            if text.startswith("```"):
+                                text = text[3:]
+                            if text.endswith("```"):
+                                text = text[:-3]
+                            cleaned_data[key] = text.strip()
+                            print(f"   🧹 Balises markdown supprimées du champ '{key}'")
+
+                    # Extraire les informations pertinentes
+                    sources = cleaned_data.get("sources", []) or cleaned_data.get("sources_officielles", [])
+
+                    # Vérification finale
+                    if "handoff" in cleaned_data:
+                        print(f"   ⚠️ ATTENTION: Le champ 'handoff' est toujours présent")
                     else:
-                        return {"reponse": str(data), "sources": []}
+                        print(f"   ✅ Réponse nettoyée : aucune trace de 'handoff'")
+
+                    # Retourner l'objet structuré directement (pas de json.dumps)
+                    return {
+                        "reponse": cleaned_data,  # Objet Python, pas une chaîne JSON
+                        "sources": sources,
+                        "data_complete": cleaned_data
+                    }
                 else:
-                    # Agent fiscal
-                    if isinstance(data, dict) and "reponse" in data:
-                        print(f"   ✅ Réponse reçue ({len(data.get('reponse', ''))} caractères)")
-                        return data
-                    else:
-                        return {"reponse": str(data), "sources": []}
-
+                    return {"reponse": str(data), "sources": []}
             except ValueError as e:
                 print(f"   ⚠️ Réponse non-JSON: {e}")
                 return {"reponse": response.text, "sources": []}
@@ -427,21 +427,46 @@ def agent_client(request):
             }), 200, headers
 
         # ÉTAPE 4: Retourner la réponse complète
-        # Ne PAS retourner data_complete pour éviter l'affichage du handoff par l'interface
+        # Gérer le type de la réponse (objet ou chaîne)
+        reponse_data = reponse_agent.get("reponse", "Aucune réponse générée")
+
+        # Construire la réponse finale
         response_json = {
             "question": question,
             "agent_utilise": agent_cible,
-            "reponse": reponse_agent.get("reponse", "Aucune réponse générée"),
-            "sources": reponse_agent.get("sources", []),
-            "documents_trouves": reponse_agent.get("documents_trouves", 0),
             "confiance": confiance
         }
 
-        # N'ajouter data_complete QUE s'il ne contient PAS de handoff
-        if "data_complete" in reponse_agent:
-            data_complete = reponse_agent.get("data_complete")
-            if isinstance(data_complete, dict) and "handoff" not in data_complete:
-                response_json["data_complete"] = data_complete
+        # Si la réponse est un objet (dict), extraire les champs intelligemment
+        if isinstance(reponse_data, dict):
+            # Extraire le champ 'reponse' de l'agent (si présent)
+            if "reponse" in reponse_data:
+                response_json["reponse"] = reponse_data["reponse"]
+            else:
+                # Si pas de champ 'reponse', utiliser le message ou l'objet complet
+                response_json["reponse"] = reponse_data.get("message", json.dumps(reponse_data, indent=2, ensure_ascii=False))
+
+            # Extraire la confiance de l'agent (si présente)
+            if "confiance" in reponse_data:
+                response_json["confiance_agent"] = reponse_data["confiance"]
+
+            # Extraire les sources de l'agent (priorité sur celles de l'agent client)
+            if "sources" in reponse_data:
+                response_json["sources"] = reponse_data["sources"]
+            else:
+                response_json["sources"] = reponse_agent.get("sources", [])
+        else:
+            # Si c'est une chaîne, l'utiliser directement
+            response_json["reponse"] = str(reponse_data)
+            response_json["sources"] = reponse_agent.get("sources", [])
+
+        # Ajouter documents_trouves si présent
+        if reponse_agent.get("documents_trouves"):
+            response_json["documents_trouves"] = reponse_agent["documents_trouves"]
+
+        # NE JAMAIS ajouter data_complete pour éviter complètement l'affichage du handoff
+        # (même si nettoyé, certaines interfaces peuvent essayer de l'afficher)
+        # Si vraiment nécessaire, on peut l'ajouter plus tard avec un flag spécifique
 
         return jsonify(response_json), 200, headers
 
