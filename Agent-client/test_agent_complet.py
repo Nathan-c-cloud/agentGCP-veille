@@ -5,6 +5,7 @@ import os
 os.environ["PROJECT_ID"] = "agent-gcp-f6005"
 
 from agent_client import classifier_question, appeler_agent_specialise
+import json
 
 def test_classification_et_appel():
     """
@@ -52,7 +53,37 @@ def test_classification_et_appel():
             print(f"   ❌ Erreur: {reponse['erreur']}")
         if "reponse" in reponse:
             reponse_text = reponse['reponse']
-            print(f"   💬 Réponse ({len(reponse_text)} caractères) : {reponse_text[:150]}...")
+
+            # Essayer de parser le JSON pour afficher proprement (sans handoff)
+            try:
+                reponse_json = json.loads(reponse_text) if isinstance(reponse_text, str) else reponse_text
+
+                # Extraire les informations importantes (sans handoff)
+                if isinstance(reponse_json, dict):
+                    print(f"   💬 Réponse structurée :")
+
+                    # Afficher les aides identifiées (pour agent aides)
+                    if "aides_identifiees" in reponse_json:
+                        aides = reponse_json["aides_identifiees"]
+                        print(f"      • {len(aides)} aide(s) identifiée(s)")
+                        for i, aide in enumerate(aides[:2], 1):  # Afficher max 2 aides
+                            print(f"        {i}. {aide.get('nom', 'N/A')}")
+
+                    # Afficher le résumé de la réponse (pour agent juridique)
+                    elif "reponse" in reponse_json:
+                        resume = reponse_json["reponse"][:200]
+                        print(f"      • {resume}...")
+
+                    # Afficher disclaimer s'il existe
+                    if "disclaimer" in reponse_json:
+                        disclaimer = reponse_json["disclaimer"][:150]
+                        print(f"      • Disclaimer: {disclaimer}...")
+                else:
+                    print(f"   💬 Réponse ({len(reponse_text)} caractères) : {reponse_text[:150]}...")
+            except:
+                # Si ce n'est pas du JSON, afficher tel quel
+                print(f"   💬 Réponse ({len(reponse_text)} caractères) : {reponse_text[:150]}...")
+
         if "sources" in reponse:
             print(f"   📚 Sources: {len(reponse['sources'])} document(s)")
 
@@ -91,4 +122,3 @@ def test_classification_et_appel():
 
 if __name__ == "__main__":
     test_classification_et_appel()
-

@@ -19,5 +19,5 @@ COPY . .
 # Exposer le port (8080 est le port par défaut pour Cloud Run)
 EXPOSE 8080
 
-# Commande pour lancer l'application avec Gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "main:app"]
+# Commande pour lancer l'application avec Gunicorn (timeout 120s pour les appels RAG)
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--timeout", "120", "main:app"]

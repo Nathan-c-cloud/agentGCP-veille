@@ -10,6 +10,21 @@ app = Flask(__name__)
 PROJECT_ID = os.environ.get("PROJECT_ID", "agent-gcp-f6005")
 LOCATION = os.environ.get("LOCATION", "us-west1")
 
+# --- CORRECTION: Initialiser le client GenAI globalement (une seule fois au démarrage) ---
+print("Agent Aides: Initialisation du client GenAI au démarrage du conteneur...")
+try:
+    client = genai.Client(
+        vertexai=True,
+        project=PROJECT_ID,
+        location=LOCATION
+    )
+    print("Agent Aides: Client GenAI initialisé avec succès.")
+except Exception as e:
+    print(f"ERREUR FATALE: Impossible d'initialiser le client GenAI: {e}")
+    import traceback
+    traceback.print_exc()
+    client = None  # Gérer l'échec d'initialisation
+
 # --- Définition du Prompt ---
 SI_TEXT_AIDES = """Tu es un Agent_Aides. Ta mission : identifier et résumer les aides publiques pertinentes pour une entreprise française (nationales, régionales, européennes), et fournir une sortie JSON strictement conforme au schéma.
 
@@ -75,6 +90,13 @@ def query():
     """
     Endpoint pour traiter les requêtes utilisateur.
     """
+    # Vérifier que le client est initialisé
+    if client is None:
+        print("Agent Aides: ERREUR - Client GenAI non initialisé")
+        return jsonify({
+            "error": "Erreur serveur: Client IA non initialisé"
+        }), 500
+
     data = request.get_json()
     if not data or "user_query" not in data:
         return jsonify({"error": "Missing 'user_query' in JSON payload"}), 400
@@ -91,25 +113,6 @@ def query():
         print(f"  - Localisation: {company_info.get('localisation', {}).get('ville', 'N/A')}")
         print(f"  - Taille: {company_info.get('taille', 'N/A')}")
         print(f"  - Secteur: {company_info.get('secteur_activite', 'N/A')}")
-
-    # Créer le client à l'intérieur de la fonction (évite les problèmes de lifecycle)
-    try:
-        print(f"Agent Aides: Initialisation du client genai...")
-        client = genai.Client(
-            vertexai=True,
-            project=PROJECT_ID,
-            location=LOCATION
-        )
-        print(f"Agent Aides: Client initialisé avec succès")
-
-    except Exception as e:
-        print(f"Erreur lors de l'initialisation du client genai: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "error": "Erreur d'initialisation du client",
-            "details": str(e)
-        }), 500
 
     # Enrichir la requête utilisateur avec les infos de l'entreprise
     enriched_query = user_query
@@ -175,12 +178,6 @@ Considérez la localisation (région, département), la taille (TPE/PME/ETI), le
             # Retourner quand même la réponse brute
             json_data = {"reponse_brute": json_response_text}
 
-        # Fermer explicitement le client
-        try:
-            client.close()
-        except:
-            pass
-
         # Renvoyer le JSON à l'Orchestrateur
         return jsonify(json_data), 200
 
@@ -188,12 +185,6 @@ Considérez la localisation (région, département), la taille (TPE/PME/ETI), le
         print(f"Erreur lors de la génération de contenu: {e}")
         import traceback
         traceback.print_exc()
-
-        # Fermer le client en cas d'erreur
-        try:
-            client.close()
-        except:
-            pass
 
         return jsonify({
             "error": "Internal server error",

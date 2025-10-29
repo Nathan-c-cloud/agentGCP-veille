@@ -162,7 +162,7 @@ def classifier_question(question: str) -> Tuple[str, float]:
         response = model.generate_content(prompt)
         agent_cible = response.text.strip().lower()
 
-        # Validation
+        # Validation stricte
         if agent_cible in AGENTS_CONFIG:
             print(f"   ✅ Agent identifié : {agent_cible}")
             return agent_cible, 0.9
@@ -170,12 +170,50 @@ def classifier_question(question: str) -> Tuple[str, float]:
             print(f"   ⚠️ Question non pertinente")
             return "non_pertinent", 0.8
         else:
-            print(f"   ⚠️ Classification incertaine : {agent_cible}")
-            return "fiscalite", 0.5
+            # Classification incertaine : essayer de détecter des mots-clés
+            print(f"   ⚠️ Classification incertaine de Gemini : '{agent_cible}'")
+            print(f"   🔍 Tentative de matching par mots-clés...")
+
+            question_lower = question.lower()
+
+            # Matching par mots-clés (ordre de priorité)
+            if any(word in question_lower for word in ["aide", "subvention", "financement", "bpi", "prêt", "crédit", "dispositif"]):
+                print(f"   ✅ Détection par mots-clés : aides")
+                return "aides", 0.7
+            elif any(word in question_lower for word in ["juridique", "statut", "sas", "sarl", "eurl", "société", "contrat", "droit"]):
+                print(f"   ✅ Détection par mots-clés : juridique")
+                return "juridique", 0.7
+            elif any(word in question_lower for word in ["tva", "impôt", "is", "ir", "cfe", "taxe", "fiscal", "déclaration"]):
+                print(f"   ✅ Détection par mots-clés : fiscalite")
+                return "fiscalite", 0.7
+            elif any(word in question_lower for word in ["comptab", "bilan", "compte", "écriture", "amortissement"]):
+                print(f"   ✅ Détection par mots-clés : comptabilite")
+                return "comptabilite", 0.7
+            elif any(word in question_lower for word in ["rh", "salarié", "contrat travail", "paie", "congé", "embauche"]):
+                print(f"   ✅ Détection par mots-clés : ressources_humaines")
+                return "ressources_humaines", 0.7
+            else:
+                # Vraiment incertain - demander à l'utilisateur de reformuler
+                print(f"   ❓ Impossible de classifier : '{question}'")
+                return "non_pertinent", 0.3
 
     except Exception as e:
         print(f"   ❌ Erreur lors de la classification : {e}")
-        return "fiscalite", 0.3
+        import traceback
+        traceback.print_exc()
+
+        # En cas d'erreur, essayer le matching par mots-clés
+        print(f"   🔍 Tentative de classification par mots-clés après erreur...")
+        question_lower = question.lower()
+
+        if any(word in question_lower for word in ["aide", "subvention", "financement"]):
+            return "aides", 0.6
+        elif any(word in question_lower for word in ["juridique", "statut", "sas", "sarl", "contrat"]):
+            return "juridique", 0.6
+        elif any(word in question_lower for word in ["tva", "impôt", "is", "ir", "fiscal"]):
+            return "fiscalite", 0.6
+        else:
+            return "non_pertinent", 0.2
 
 
 def appeler_agent_specialise(agent_name: str, question: str) -> Dict:
@@ -249,20 +287,38 @@ def appeler_agent_specialise(agent_name: str, question: str) -> Dict:
                         # Nettoyer les données: supprimer les champs handoff si non nécessaires
                         cleaned_data = data.copy()
 
-                        # Supprimer les informations de handoff si handoff.needed = false
-                        if isinstance(cleaned_data.get("handoff"), dict):
+                        # Supprimer COMPLÈTEMENT les informations de handoff si handoff.needed = false ou non défini
+                        if "handoff" in cleaned_data:
                             handoff = cleaned_data.get("handoff", {})
+                            # Supprimer le handoff s'il n'est pas nécessaire
                             if not handoff.get("needed", False):
-                                # Supprimer complètement la section handoff si elle n'est pas nécessaire
-                                cleaned_data.pop("handoff", None)
+                                del cleaned_data["handoff"]
+                                print(f"   🧹 Section handoff supprimée (non nécessaire)")
+                            else:
+                                print(f"   ⚠️ Handoff nécessaire conservé : {handoff}")
+
+                        # Double vérification : s'assurer qu'il n'y a pas de handoff avec needed=false
+                        if "handoff" in cleaned_data and not cleaned_data["handoff"].get("needed", False):
+                            del cleaned_data["handoff"]
+                            print(f"   🧹 Double suppression du handoff (sécurité)")
 
                         # Extraire les informations pertinentes
                         sources = cleaned_data.get("sources", []) or cleaned_data.get("sources_officielles", [])
 
+                        # Créer le JSON sans le handoff inutile
+                        json_response = json.dumps(cleaned_data, indent=2, ensure_ascii=False)
+
+                        # Vérification finale : le mot "handoff" ne doit pas apparaître dans la réponse
+                        # (sauf si vraiment nécessaire)
+                        if '"handoff"' in json_response.lower():
+                            print(f"   ⚠️ ATTENTION: Le mot 'handoff' est toujours présent dans la réponse JSON")
+                        else:
+                            print(f"   ✅ Réponse nettoyée : aucune trace de 'handoff'")
+
                         return {
-                            "reponse": json.dumps(cleaned_data, indent=2, ensure_ascii=False),
+                            "reponse": json_response,
                             "sources": sources,
-                            "data_complete": cleaned_data
+                            "data_complete": cleaned_data  # cleaned_data n'a plus de handoff
                         }
                     else:
                         return {"reponse": str(data), "sources": []}
@@ -371,15 +427,23 @@ def agent_client(request):
             }), 200, headers
 
         # ÉTAPE 4: Retourner la réponse complète
-        return jsonify({
+        # Ne PAS retourner data_complete pour éviter l'affichage du handoff par l'interface
+        response_json = {
             "question": question,
             "agent_utilise": agent_cible,
             "reponse": reponse_agent.get("reponse", "Aucune réponse générée"),
             "sources": reponse_agent.get("sources", []),
             "documents_trouves": reponse_agent.get("documents_trouves", 0),
-            "confiance": confiance,
-            "data_complete": reponse_agent.get("data_complete")
-        }), 200, headers
+            "confiance": confiance
+        }
+
+        # N'ajouter data_complete QUE s'il ne contient PAS de handoff
+        if "data_complete" in reponse_agent:
+            data_complete = reponse_agent.get("data_complete")
+            if isinstance(data_complete, dict) and "handoff" not in data_complete:
+                response_json["data_complete"] = data_complete
+
+        return jsonify(response_json), 200, headers
 
     except Exception as e:
         print(f"\n❌ ERREUR GLOBALE: {e}")
