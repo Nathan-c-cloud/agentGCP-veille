@@ -464,9 +464,7 @@ def agent_client(request):
         if reponse_agent.get("documents_trouves"):
             response_json["documents_trouves"] = reponse_agent["documents_trouves"]
 
-        # NE JAMAIS ajouter data_complete pour éviter complètement l'affichage du handoff
-        # (même si nettoyé, certaines interfaces peuvent essayer de l'afficher)
-        # Si vraiment nécessaire, on peut l'ajouter plus tard avec un flag spécifique
+        # NE PAS ajouter data_complete - cela évite de publier handoff, target_agent et reason au frontend
 
         return jsonify(response_json), 200, headers
 
